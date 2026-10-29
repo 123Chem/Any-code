@@ -1,12 +1,12 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Represents a project in the ~/.claude/projects directory
+/// Represents a logical project grouped by original session working directory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
-    /// The project ID (derived from the directory name)
+    /// Stable working-directory identity; this is not a physical history directory.
     pub id: String,
-    /// The original project path (decoded from the directory name)
+    /// Original trusted cwd; empty when historical ownership cannot be confirmed.
     pub path: String,
     /// List of session IDs (JSONL file names without extension)
     pub sessions: Vec<String>,
@@ -21,7 +21,7 @@ pub struct Session {
     pub id: String,
     /// The project ID this session belongs to
     pub project_id: String,
-    /// The project path
+    /// This transcript's original trusted cwd, independent of its storage directory.
     pub project_path: String,
     /// Optional todo data associated with this session
     pub todo_data: Option<Value>,

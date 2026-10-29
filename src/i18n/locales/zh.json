@@ -1,4 +1,14 @@
 {
+  "nativeCompact": {
+    "effortRequestHint": "这里显示请求的强度；实际采用哪一档由 Claude 版本、模型和已有上限决定。",
+    "title": "本会话自动压缩",
+    "inherit": "跟随Claude设置",
+    "pending": "已保存，下一次工作开始时采用",
+    "checkpoint": "由Claude在模型请求前检查，工作会话保持不变",
+    "observed": "本次运行已观察到压缩",
+    "effort": "本会话思考强度",
+    "aboveEstimate": "已超过估计阈值，实际压缩由Claude请求检查点决定"
+  },
   "app": {
     "title": "Claude Workbench",
     "subtitle": "专业的 Claude CLI 桌面应用和开发工具包"
@@ -694,6 +704,7 @@
     "collapseContent": "收起内容"
   },
   "session": {
+    "unverifiedReadOnly": "原会话工作目录尚未确认，只能查看历史；请刷新原项目后续聊。",
     "userCancelled": "用户已取消会话",
     "loadingHistory": "加载会话历史记录...",
     "initializingClaude": "初始化 Claude Code...",
@@ -1004,6 +1015,7 @@
     "loading": "加载 GEMINI.md..."
   },
   "promptInput": {
+    "recoverLegacyDraft": "恢复旧版未归属草稿到当前会话",
     "placeholder": "向 Claude 提问...",
     "placeholderDragActive": "拖放图片到这里...",
     "expandInput": "展开输入框",
@@ -1017,14 +1029,15 @@
     "doubleClickSkipTyping": "双击跳过打字效果",
     "thinkingModeOff": "思考模式: 关闭",
     "thinkingModeOn": "思考模式: 开启",
-    "normalSpeed": "正常响应速度",
+    "normalSpeed": "保留 Claude 原来的默认设置",
     "deepThinking": "启用深度思考 (32K tokens)",
     "thinkingOn": "思考: 开",
-    "thinkingOff": "关",
+    "thinkingOff": "跟随 Claude",
     "thinkingEnabled": "自适应思考已启用",
-    "thinkingDisabled": "自适应思考已关闭",
-    "adaptiveThinking": "自适应思考 ({{effort}})",
-    "effortDescription": "点击切换思考深度级别",
+    "thinkingDisabled": "本会话跟随 Claude 配置的思考强度",
+    "adaptiveThinking": "本会话思考强度：{{effort}}",
+    "effortDescription": "点击切换，仅本会话生效；新选择从下一轮采用",
+    "effortMaxDescription": "Max 是 Claude Code 的真实最高档；没有独立的 Ultra 档，具体支持由模型决定。",
     "thinkingEffortLow": "思考: 低",
     "thinkingEffortLowDesc": "快速响应，最少思考",
     "thinkingEffortMedium": "思考: 中",

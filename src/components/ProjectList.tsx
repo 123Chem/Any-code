@@ -159,7 +159,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
   // Load Gemini sessions for current page projects
   useEffect(() => {
     currentProjects.forEach(project => {
-      if (!geminiSessionsMap.has(project.path)) {
+      if (project.path && !geminiSessionsMap.has(project.path)) {
         loadGeminiSessions(project.path);
       }
     });
@@ -218,6 +218,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
     const projectPathNorm = normalizePath(project.path);
 
     const codexSessionCount = codexSessions.filter(cs => {
+      if (!projectPathNorm) return false;
       const csPathNorm = normalizePath(cs.projectPath);
       return csPathNorm === projectPathNorm;
     }).length;
@@ -275,7 +276,8 @@ export const ProjectList: React.FC<ProjectListProps> = ({
         aria-label={t('projectList.projectListLabel')}
       >
         {currentProjects.map((project) => {
-          const projectName = getProjectName(project.path);
+          const projectName = project.path ? getProjectName(project.path)
+            : `${t('projectList.unconfirmedOwnership', { defaultValue: '项目归属未确认（只读）' })} ${project.id.slice(-8)}`;
           const sessionBreakdown = getSessionBreakdown(project);
           const sessionCount = sessionBreakdown.total;
 
@@ -318,7 +320,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                       "text-xs text-muted-foreground/80 truncate font-mono bg-[var(--surface-code)] border border-[var(--surface-hairline-soft)] px-1.5 py-0.5 rounded",
                       viewMode === "grid" ? "max-w-full" : "max-w-[200px]"
                     )}>
-                      {viewMode === "grid" ? project.path : project.path}
+                      {project.path || t('projectList.unconfirmedOwnershipHint', { defaultValue: '原会话工作目录无法确认，可查看历史' })}
                     </p>
                   </div>
                 </div>
@@ -408,7 +410,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                         </Button>
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end">
-                        {onProjectSettings && (
+                        {onProjectSettings && project.path && (
                           <DropdownMenuItem
                             onClick={(e) => {
                               e.stopPropagation();
@@ -419,7 +421,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                             {t('projectList.hooksConfig')}
                           </DropdownMenuItem>
                         )}
-                        {onProjectSettings && onProjectDelete && (
+                        {onProjectSettings && onProjectDelete && project.path && (
                           <DropdownMenuSeparator />
                         )}
                         {onProjectDelete && (

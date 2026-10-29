@@ -37,60 +37,22 @@ pub struct CurrentConfig {
 
 // 获取Claude设置文件路径
 fn get_settings_path() -> Result<PathBuf, String> {
-    let home_dir = dirs::home_dir().ok_or_else(|| "无法获取用户主目录".to_string())?;
-
-    let config_dir = home_dir.join(".claude");
-
-    // 确保配置目录存在
-    if !config_dir.exists() {
-        fs::create_dir_all(&config_dir).map_err(|e| format!("无法创建配置目录: {}", e))?;
-    }
-
-    Ok(config_dir.join("settings.json"))
+    Ok(super::claude::get_claude_dir().map_err(|error| error.to_string())?.join("settings.json"))
 }
 
 // 获取遗留的providers.json路径（用于迁移）
 fn get_legacy_providers_path() -> Result<PathBuf, String> {
-    let home_dir = dirs::home_dir().ok_or_else(|| "无法获取用户主目录".to_string())?;
-    Ok(home_dir.join(".claude").join("providers.json"))
+    Ok(super::claude::get_claude_dir().map_err(|error| error.to_string())?.join("providers.json"))
 }
 
 // 读取settings.json文件
 fn load_settings() -> Result<Value, String> {
-    let settings_path = get_settings_path()?;
-
-    if !settings_path.exists() {
-        // 创建默认设置文件
-        let default_settings = serde_json::json!({
-            "env": {}
-        });
-
-        let content = serde_json::to_string_pretty(&default_settings)
-            .map_err(|e| format!("序列化默认设置失败: {}", e))?;
-
-        fs::write(&settings_path, content).map_err(|e| format!("创建默认设置文件失败: {}", e))?;
-
-        return Ok(default_settings);
-    }
-
-    let content =
-        fs::read_to_string(&settings_path).map_err(|e| format!("读取设置文件失败: {}", e))?;
-
-    let settings: Value =
-        serde_json::from_str(&content).map_err(|e| format!("解析设置文件失败: {}", e))?;
-
-    Ok(settings)
+    super::claude::settings_store::read(&get_settings_path()?)
 }
 
 // 保存settings.json文件
-fn save_settings(settings: &Value) -> Result<(), String> {
-    let settings_path = get_settings_path()?;
-
-    let content =
-        serde_json::to_string_pretty(settings).map_err(|e| format!("序列化设置失败: {}", e))?;
-
-    fs::write(&settings_path, content).map_err(|e| format!("写入设置文件失败: {}", e))?;
-
+fn save_settings(settings: &Value, baseline: &Value) -> Result<(), String> {
+    super::claude::settings_store::update(&get_settings_path()?, settings, Some(baseline))?;
     Ok(())
 }
 
@@ -307,6 +269,7 @@ pub async fn switch_provider_config(
     validate_third_party_config(&config)?;
 
     let mut settings = load_settings()?;
+    let baseline = settings.clone();
 
     // 确保env字段存在
     if !settings.is_object() {
@@ -429,7 +392,7 @@ pub async fn switch_provider_config(
     }
 
     // 保存设置
-    save_settings(&settings)?;
+    save_settings(&settings, &baseline)?;
 
     log::info!("代理商配置切换完成: {}", config.name);
 
@@ -482,6 +445,7 @@ pub async fn clear_provider_config(_app: AppHandle) -> Result<String, String> {
     log::info!("开始清理代理商配置");
 
     let mut settings = load_settings()?;
+    let baseline = settings.clone();
 
     // 如果有env字段，清理ANTHROPIC相关变量
     if let Some(env_obj) = settings.get_mut("env").and_then(|v| v.as_object_mut()) {
@@ -500,7 +464,7 @@ pub async fn clear_provider_config(_app: AppHandle) -> Result<String, String> {
     }
 
     // 保存设置
-    save_settings(&settings)?;
+    save_settings(&settings, &baseline)?;
 
     log::info!("代理商配置清理完成");
 

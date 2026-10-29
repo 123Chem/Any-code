@@ -6,6 +6,7 @@ import React, {
   useCallback,
 } from "react";
 import type { UpdateInfo, UpdateHandle } from "../lib/updater";
+import { IS_LOCAL_REPAIR_BUILD } from "../lib/repair-build";
 import { useUpdateCheck } from "../hooks/useUpdateCheck";
 
 interface UpdateContextValue {
@@ -123,6 +124,7 @@ export function UpdateProvider({ children }: { children: React.ReactNode }) {
 
   // 应用启动时自动检查更新
   useEffect(() => {
+    if (IS_LOCAL_REPAIR_BUILD) return;
     // 延迟2秒后检查，避免影响启动体验
     const timer = setTimeout(() => {
       checkUpdate(false).catch(console.error);

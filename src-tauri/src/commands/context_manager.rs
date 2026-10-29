@@ -124,7 +124,7 @@ pub struct AutoCompactManager {
 impl Default for AutoCompactConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             max_context_tokens: 120000, // Claude 4 context window
             compaction_threshold: 0.85,
             min_compaction_interval: 300, // 5 minutes
@@ -501,6 +501,9 @@ impl AutoCompactManager {
 
     /// Update configuration
     pub fn update_config(&self, new_config: AutoCompactConfig) -> Result<(), String> {
+        if new_config.enabled {
+            return Err("Legacy background compaction is disabled; use the native per-session compaction setting".into());
+        }
         let mut config = self.config.lock().map_err(|e| e.to_string())?;
         *config = new_config;
         info!("Auto-compact configuration updated");

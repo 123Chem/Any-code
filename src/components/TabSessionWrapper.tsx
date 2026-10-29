@@ -1,6 +1,6 @@
 import React, { useRef, useEffect, useCallback } from 'react';
 import { ClaudeCodeSession } from './ClaudeCodeSession';
-import { useTabSession } from '@/hooks/useTabs';
+import { normalizeTabProjectPath, useTabSession } from '@/hooks/useTabs';
 import type { Session } from '@/lib/api';
 
 interface TabSessionWrapperProps {
@@ -24,7 +24,7 @@ const TabSessionWrapperComponent: React.FC<TabSessionWrapperProps> = ({
   isActive,
 }) => {
   // ✅ FIXED: Removed unused 'tab' variable to fix TS6133
-  const { updateStreaming, setCleanup, updateTitle, updateEngine, updateSession } = useTabSession(tabId);
+  const { updateStreaming, setCleanup, updateTitle, updateProjectPath, updateEngine, updateSession } = useTabSession(tabId);
   const sessionRef = useRef<{ hasChanges: boolean; sessionId: string | null }>({
     hasChanges: false,
     sessionId: null,
@@ -35,6 +35,10 @@ const TabSessionWrapperComponent: React.FC<TabSessionWrapperProps> = ({
   // defined (via updateTabSession + isActive-triggered re-render). This prevents ClaudeCodeSession
   // from auto-loading/resuming the session that was created by its own streaming.
   const initialSessionRef = useRef<Session | undefined>(session);
+  const establishedOwnerRef = useRef<{ id: string; path: string } | null>(session
+    ? { id: session.id, path: session.project_path } : null);
+  const selectedPathRef = useRef(initialProjectPath || session?.project_path);
+  const selectedEngineRef = useRef(session?.engine);
   // Determine the effective session to pass to ClaudeCodeSession:
   // - If the initial session was undefined (new tab), always pass undefined
   //   (the component manages its own session through extractedSessionInfo)
@@ -74,22 +78,33 @@ const TabSessionWrapperComponent: React.FC<TabSessionWrapperProps> = ({
 
   // 🔧 NEW: Handle project path change and update tab title
   const handleProjectPathChange = useCallback((newPath: string) => {
+    const owner = establishedOwnerRef.current;
+    if (owner && normalizeTabProjectPath(owner.path) !== normalizeTabProjectPath(newPath)) return;
     if (newPath && newPath !== '__NEW_PROJECT__') {
+      selectedPathRef.current = newPath;
+      updateProjectPath(newPath);
       const projectName = extractProjectName(newPath);
       if (projectName) {
         updateTitle(projectName);
       }
     }
-  }, [extractProjectName, updateTitle]);
+  }, [extractProjectName, updateTitle, updateProjectPath]);
 
   // 🆕 Handle engine change - 更新标签页显示的引擎类型
   const handleEngineChange = useCallback((engine: 'claude' | 'codex' | 'gemini') => {
+    selectedEngineRef.current = engine;
     updateEngine(engine);
   }, [updateEngine]);
 
   // 🔧 FIX: Handle session info change - 持久化新建会话的信息
   // 解决路由切换后新建会话消息丢失的问题
   const handleSessionInfoChange = useCallback((info: { sessionId: string; projectId: string; projectPath: string; engine?: 'claude' | 'codex' | 'gemini' }) => {
+    if ((selectedPathRef.current && normalizeTabProjectPath(selectedPathRef.current) !== normalizeTabProjectPath(info.projectPath))
+      || (selectedEngineRef.current && selectedEngineRef.current !== (info.engine || 'claude'))) return;
+    const owner = establishedOwnerRef.current;
+    if (owner && (owner.id !== info.sessionId
+      || normalizeTabProjectPath(owner.path) !== normalizeTabProjectPath(info.projectPath))) return;
+    establishedOwnerRef.current = { id: info.sessionId, path: info.projectPath };
     console.debug('[TabSessionWrapper] Session info received, updating tab:', { tabId, info });
     updateSession(info);
   }, [tabId, updateSession]);
@@ -122,6 +137,7 @@ const TabSessionWrapperComponent: React.FC<TabSessionWrapperProps> = ({
       // 🔧 REMOVED: display control CSS - now using conditional rendering
     >
       <ClaudeCodeSession
+        draftScope={tabId}
         session={effectiveSessionForChild}
         initialProjectPath={initialProjectPath}
         onStreamingChange={handleStreamingChange}

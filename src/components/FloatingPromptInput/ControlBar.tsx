@@ -33,6 +33,7 @@ interface ControlBarProps {
   availableModels: ModelConfig[];
   selectedThinkingMode: string;
   selectedThinkingEffort?: ThinkingEffort;
+  thinkingDisabled?: boolean;
   handleToggleThinkingMode: () => void;
   isPlanMode?: boolean;
   onTogglePlanMode?: () => void;
@@ -68,6 +69,7 @@ export const ControlBar: React.FC<ControlBarProps> = ({
   availableModels,
   selectedThinkingMode,
   selectedThinkingEffort,
+  thinkingDisabled,
   handleToggleThinkingMode,
   isPlanMode,
   onTogglePlanMode,
@@ -149,7 +151,7 @@ export const ControlBar: React.FC<ControlBarProps> = ({
             isEnabled={selectedThinkingMode === "adaptive"}
             effort={selectedThinkingEffort}
             onToggle={handleToggleThinkingMode}
-            disabled={disabled}
+            disabled={disabled || thinkingDisabled}
           />
 
           {onTogglePlanMode && (
@@ -254,6 +256,8 @@ export const ControlBar: React.FC<ControlBarProps> = ({
       {/* Context Window Indicator - Claude / Codex / Gemini 引擎显示 */}
       {(executionEngineConfig.engine === 'claude' || executionEngineConfig.engine === 'codex' || executionEngineConfig.engine === 'gemini') && hasMessages && messages && (
         <ContextWindowIndicator
+          sessionId={session?.id}
+          projectPath={projectPath}
           messages={messages}
           model={contextWindowModel}
           engine={executionEngineConfig.engine}

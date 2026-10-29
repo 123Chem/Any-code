@@ -28,6 +28,7 @@ interface ExpandedModalProps {
   availableModels: ModelConfig[];
   selectedThinkingMode: string;
   selectedThinkingEffort?: ThinkingEffort;
+  thinkingDisabled?: boolean;
   handleToggleThinkingMode: () => void;
   isPlanMode?: boolean;
   onTogglePlanMode?: () => void;
@@ -106,6 +107,7 @@ export const ExpandedModal = forwardRef<HTMLTextAreaElement, ExpandedModalProps>
   availableModels,
   selectedThinkingMode,
   selectedThinkingEffort,
+  thinkingDisabled,
   handleToggleThinkingMode,
   isPlanMode,
   onTogglePlanMode,
@@ -256,7 +258,7 @@ export const ExpandedModal = forwardRef<HTMLTextAreaElement, ExpandedModalProps>
                   isEnabled={selectedThinkingMode === "adaptive"}
                   effort={selectedThinkingEffort}
                   onToggle={handleToggleThinkingMode}
-                  disabled={disabled}
+                  disabled={disabled || thinkingDisabled}
                 />
                 {onTogglePlanMode && (
                   <PlanModeToggle

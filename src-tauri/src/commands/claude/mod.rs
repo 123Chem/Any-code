@@ -1,12 +1,20 @@
 mod cli_runner;
 mod config;
 mod file_ops;
+mod file_access;
 mod hooks;
 mod models;
 mod paths;
 mod platform;
 mod project_store;
+pub(crate) mod project_identity;
+pub use project_identity::{resolve_claude_project_identity, resolve_claude_session_identity};
 mod session_history;
+pub(crate) mod settings_store;
+pub(crate) mod session_policy;
+pub(crate) mod session_metadata;
+mod managed_policy;
+pub use session_policy::{get_claude_session_policy, set_claude_session_policy, set_claude_session_effort};
 
 pub use models::*;
 pub use paths::*;
@@ -160,6 +168,12 @@ pub async fn delete_project_permanently(project_id: String) -> Result<String, St
 pub async fn list_hidden_projects() -> Result<Vec<String>, String> {
     let store = ProjectStore::new()?;
     store.list_hidden_projects()
+}
+
+#[tauri::command]
+pub async fn list_hidden_project_details() -> Result<Vec<Project>, String> {
+    let store = ProjectStore::new()?;
+    store.list_hidden_project_details()
 }
 
 /// Reads the Claude settings file

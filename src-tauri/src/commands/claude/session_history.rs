@@ -8,6 +8,10 @@ use serde_json::Value;
 
 use super::models::JsonlEntry;
 use super::paths::get_claude_dir;
+use super::project_identity;
+
+#[path = "session_summary.rs"]
+mod session_summary;
 
 /// Extracts the first valid user message from a JSONL file
 pub fn extract_first_user_message<P: AsRef<Path>>(
@@ -88,62 +92,18 @@ pub fn extract_first_user_message<P: AsRef<Path>>(
 
 /// Extracts the timestamp of the last message (user or assistant) from a JSONL file
 pub fn extract_last_message_timestamp<P: AsRef<Path>>(jsonl_path: P) -> Option<String> {
-    let file = match fs::File::open(jsonl_path) {
-        Ok(file) => file,
-        Err(_) => return None,
-    };
-
-    let reader = BufReader::new(file);
-    let mut last_timestamp: Option<String> = None;
-
-    for line in reader.lines() {
-        if let Ok(line) = line {
-            if let Ok(entry) = serde_json::from_str::<JsonlEntry>(&line) {
-                // Check if this entry has a message (user or assistant)
-                if entry.message.is_some() {
-                    // Update last_timestamp if this entry has a timestamp
-                    if let Some(timestamp) = entry.timestamp {
-                        last_timestamp = Some(timestamp);
-                    }
-                }
-            }
-        }
-    }
-
-    last_timestamp
+    extract_session_summary(jsonl_path.as_ref()).0
 }
 
 /// Extracts the model used in the session from a JSONL file
 /// Looks for model information in system init messages or assistant messages
 pub fn extract_session_model<P: AsRef<Path>>(jsonl_path: P) -> Option<String> {
-    let file = match fs::File::open(jsonl_path) {
-        Ok(file) => file,
-        Err(_) => return None,
-    };
+    extract_session_summary(jsonl_path.as_ref()).1
+}
 
-    let reader = BufReader::new(file);
-    let mut last_model: Option<String> = None;
-
-    for line in reader.lines() {
-        if let Ok(line) = line {
-            // Try to parse as a generic JSON value first
-            if let Ok(entry) = serde_json::from_str::<Value>(&line) {
-                // Check for model in different locations:
-                // 1. System init message: { "type": "system", "model": "..." }
-                // 2. Assistant message: { "type": "assistant", "message": { "model": "..." } }
-
-                if let Some(model_str) = entry.get("model").and_then(|m| m.as_str()) {
-                    last_model = Some(model_str.to_string());
-                } else if let Some(message) = entry.get("message") {
-                    if let Some(model_str) = message.get("model").and_then(|m| m.as_str()) {
-                        last_model = Some(model_str.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    last_model
+/// Reads both list metadata fields in one pass without allocating message payloads.
+pub(crate) fn extract_session_summary(path: &Path) -> (Option<String>, Option<String>) {
+    session_summary::extract(path)
 }
 
 /// Loads the JSONL history for a specific session
@@ -156,12 +116,19 @@ pub fn load_session_history(session_id: &str, project_id: &str) -> Result<Vec<Va
     );
 
     let claude_dir = get_claude_dir().map_err(|e| e.to_string())?;
-    let project_dir = claude_dir.join("projects").join(project_id);
-    let session_path = project_dir.join(format!("{}.jsonl", session_id));
+    load_session_history_for_root(&claude_dir, session_id, project_id)
+}
 
-    if !session_path.exists() {
-        return Err(format!("Session file not found: {}", session_id));
-    }
+pub(crate) fn load_session_history_for_root(
+    claude_dir: &Path,
+    session_id: &str,
+    project_id: &str,
+) -> Result<Vec<Value>, String> {
+    let location = project_identity::resolve_session(claude_dir, project_id, session_id)?;
+    let session_path = location.path;
+    let project_dir = session_path
+        .parent()
+        .ok_or("Claude history directory is unavailable")?;
 
     // Get file modification time as base timestamp
     let file_metadata =
@@ -221,7 +188,7 @@ pub fn load_session_history(session_id: &str, project_id: &str) -> Result<Vec<Va
 
     // Step 2: Load subagent messages from agent-*.jsonl files
     if !agent_to_tool_use_id.is_empty() {
-        if let Ok(entries) = fs::read_dir(&project_dir) {
+        if let Ok(entries) = fs::read_dir(project_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {

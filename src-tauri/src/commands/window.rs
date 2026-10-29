@@ -70,6 +70,8 @@ pub struct CreateSessionWindowParams {
     pub tab_id: String,
     /// Optional session ID (for existing sessions)
     pub session_id: Option<String>,
+    /// Logical project ID, independent of the original history directory name.
+    pub project_id: Option<String>,
     /// Project path for the session
     pub project_path: Option<String>,
     /// Window title
@@ -126,6 +128,9 @@ pub async fn create_session_window(
 
     if let Some(ref session_id) = params.session_id {
         query_parts.push(format!("session_id={}", session_id));
+    }
+    if let Some(ref project_id) = params.project_id {
+        query_parts.push(format!("project_id={}", urlencoding::encode(project_id)));
     }
 
     if let Some(ref project_path) = params.project_path {

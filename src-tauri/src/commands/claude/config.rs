@@ -34,39 +34,9 @@ pub async fn get_claude_settings() -> Result<ClaudeSettings, String> {
         });
     }
 
-    let content = fs::read_to_string(&settings_path)
-        .map_err(|e| format!("Failed to read settings file: {}", e))?;
-
-    let data: serde_json::Value = parse_settings_json(&content)
-        .map_err(|e| format!("Failed to parse settings JSON: {}", e))?;
+    let data = super::settings_store::read(&settings_path)?;
 
     Ok(ClaudeSettings { data })
-}
-
-/// Parse settings.json with recovery for common formatting mistakes (e.g. trailing commas)
-fn parse_settings_json(content: &str) -> Result<serde_json::Value, serde_json::Error> {
-    match serde_json::from_str::<serde_json::Value>(content) {
-        Ok(value) => Ok(value),
-        Err(primary_err) => {
-            log::warn!(
-                "Failed to parse settings.json, attempting recovery: {}",
-                primary_err
-            );
-
-            // Remove trailing commas before } or ]
-            let trailing_comma_regex = regex::Regex::new(r",\s*(\}|])").unwrap();
-            let sanitized = trailing_comma_regex.replace_all(content, "$1");
-
-            serde_json::from_str::<serde_json::Value>(&sanitized).map_err(|fallback_err| {
-                log::error!(
-                    "Settings recovery failed: original error: {}, fallback error: {}",
-                    primary_err,
-                    fallback_err
-                );
-                fallback_err
-            })
-        }
-    }
 }
 
 /// Opens a new Claude Code session by executing the claude command
@@ -317,79 +287,26 @@ pub async fn save_system_prompt(content: String) -> Result<String, String> {
 
 /// Saves the Claude settings file
 #[tauri::command]
-pub async fn save_claude_settings(settings: serde_json::Value) -> Result<String, String> {
-    log::info!(
-        "Saving Claude settings - received data: {}",
-        settings.to_string()
-    );
-
-    let claude_dir = get_claude_dir().map_err(|e| {
-        let error_msg = format!("Failed to get claude dir: {}", e);
-        log::error!("{}", error_msg);
-        error_msg
-    })?;
-    log::info!("Claude directory: {:?}", claude_dir);
-
-    let settings_path = claude_dir.join("settings.json");
-    log::info!("Settings path: {:?}", settings_path);
-
-    // Read existing settings to preserve unknown fields
-    let mut existing_settings = if settings_path.exists() {
-        let content = fs::read_to_string(&settings_path).ok();
-        if let Some(content) = content {
-            serde_json::from_str::<serde_json::Value>(&content).ok()
-        } else {
-            None
-        }
-    } else {
-        None
-    }
-    .unwrap_or(serde_json::json!({}));
-
-    log::info!("Existing settings: {}", existing_settings);
-
-    // Use settings directly - no wrapper expected from frontend
-    let actual_settings = &settings;
-    log::info!("Using settings directly: {}", actual_settings);
-
-    // Merge the new settings with existing settings
-    // This preserves unknown fields that the app doesn't manage
-    if let (Some(existing_obj), Some(new_obj)) = (
-        existing_settings.as_object_mut(),
-        actual_settings.as_object(),
-    ) {
-        for (key, value) in new_obj {
-            existing_obj.insert(key.clone(), value.clone());
-        }
-        log::info!("Merged settings: {}", existing_settings);
-    } else {
-        // If either is not an object, just use the new settings
-        existing_settings = actual_settings.clone();
-    }
-
-    // Pretty print the JSON with 2-space indentation
-    let json_string = serde_json::to_string_pretty(&existing_settings).map_err(|e| {
-        let error_msg = format!("Failed to serialize settings: {}", e);
-        log::error!("{}", error_msg);
-        error_msg
-    })?;
-
-    log::info!("Serialized JSON length: {} characters", json_string.len());
-
-    fs::write(&settings_path, &json_string).map_err(|e| {
-        let error_msg = format!("Failed to write settings file: {}", e);
-        log::error!("{}", error_msg);
-        error_msg
-    })?;
-
-    log::info!("Settings saved successfully to: {:?}", settings_path);
+pub async fn save_claude_settings(
+    settings: serde_json::Value,
+    expected_settings: Option<serde_json::Value>,
+) -> Result<String, String> {
+    let settings_path = get_claude_dir().map_err(|error| error.to_string())?.join("settings.json");
+    super::settings_store::update(&settings_path, &settings, expected_settings.as_ref())?;
+    log::info!("Claude settings saved with field conflict checks and preserved original");
     Ok("Settings saved successfully".to_string())
 }
 
-/// Updates the effort level in settings.json.
+/// Compatibility command for global defaults; session controls use their own policy.
 /// Sets CLAUDE_CODE_EFFORT_LEVEL env var and cleans up legacy MAX_THINKING_TOKENS.
 #[tauri::command]
 pub async fn update_thinking_mode(enabled: bool, effort: Option<String>) -> Result<String, String> {
+    if effort.as_deref().is_some_and(|value| !matches!(value, "low" | "medium" | "high" | "xhigh" | "max")) {
+        return Err("Claude effort must be low, medium, high, xhigh or max; Ultra is not a separate Claude Code level".into());
+    }
+    if enabled && super::managed_policy::constraints()?.effort_level {
+        return Err("Claude managed policy controls the effort default".into());
+    }
     log::info!(
         "Updating thinking mode: enabled={}, effort={:?}",
         enabled,
@@ -400,14 +317,8 @@ pub async fn update_thinking_mode(enabled: bool, effort: Option<String>) -> Resu
     let settings_path = claude_dir.join("settings.json");
 
     // Read existing settings
-    let mut settings = if settings_path.exists() {
-        let content = fs::read_to_string(&settings_path)
-            .map_err(|e| format!("Failed to read settings: {}", e))?;
-        serde_json::from_str::<serde_json::Value>(&content)
-            .map_err(|e| format!("Failed to parse settings: {}", e))?
-    } else {
-        serde_json::json!({})
-    };
+    let baseline = super::settings_store::read(&settings_path)?;
+    let mut settings = baseline.clone();
 
     // Ensure env object exists
     if !settings.is_object() {
@@ -447,12 +358,7 @@ pub async fn update_thinking_mode(enabled: bool, effort: Option<String>) -> Resu
         log::info!("Removed deprecated alwaysThinkingEnabled field");
     }
 
-    // Write back to file
-    let json_string = serde_json::to_string_pretty(&settings)
-        .map_err(|e| format!("Failed to serialize settings: {}", e))?;
-
-    fs::write(&settings_path, &json_string)
-        .map_err(|e| format!("Failed to write settings: {}", e))?;
+    super::settings_store::update(&settings_path, &settings, Some(&baseline))?;
 
     log::info!("Thinking mode updated successfully");
     Ok(format!(
@@ -466,14 +372,8 @@ pub async fn update_claude_fast_mode(enabled: bool) -> Result<String, String> {
     let claude_dir = get_claude_dir().map_err(|e| format!("Failed to get claude dir: {}", e))?;
     let settings_path = claude_dir.join("settings.json");
 
-    let mut settings = if settings_path.exists() {
-        let content = fs::read_to_string(&settings_path)
-            .map_err(|e| format!("Failed to read settings: {}", e))?;
-        serde_json::from_str::<serde_json::Value>(&content)
-            .map_err(|e| format!("Failed to parse settings: {}", e))?
-    } else {
-        serde_json::json!({})
-    };
+    let baseline = super::settings_store::read(&settings_path)?;
+    let mut settings = baseline.clone();
 
     if !settings.is_object() {
         settings = serde_json::json!({});
@@ -499,10 +399,7 @@ pub async fn update_claude_fast_mode(enabled: bool) -> Result<String, String> {
         }
     }
 
-    let json_string = serde_json::to_string_pretty(&settings)
-        .map_err(|e| format!("Failed to serialize settings: {}", e))?;
-    fs::write(&settings_path, &json_string)
-        .map_err(|e| format!("Failed to write settings: {}", e))?;
+    super::settings_store::update(&settings_path, &settings, Some(&baseline))?;
 
     Ok(format!(
         "Claude fast mode {} successfully",

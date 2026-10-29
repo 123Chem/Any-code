@@ -4,9 +4,14 @@ use std::path::PathBuf;
 
 /// Gets the path to the ~/.claude directory
 pub fn get_claude_dir() -> Result<PathBuf> {
-    let claude_dir = dirs::home_dir()
-        .context("Could not find home directory")?
-        .join(".claude");
+    let claude_dir = match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty()) {
+        Some(value) => {
+            let path = PathBuf::from(value);
+            anyhow::ensure!(path.is_absolute(), "CLAUDE_CONFIG_DIR must be an absolute path");
+            path
+        }
+        None => dirs::home_dir().context("Could not find home directory")?.join(".claude"),
+    };
 
     // Ensure the directory exists
     fs::create_dir_all(&claude_dir).context("Failed to create ~/.claude directory")?;

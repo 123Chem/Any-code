@@ -27,7 +27,7 @@ import {
 } from '@/components/ui/dialog';
 import { cn } from '@/lib/utils';
 import { TabSessionWrapper } from './TabSessionWrapper';
-import { useTabs } from '@/hooks/useTabs';
+import { sameTabSessionIdentity, useTabs } from '@/hooks/useTabs';
 import { useSessionSync } from '@/hooks/useSessionSync'; // 🔧 NEW: 会话状态同步
 import { selectProjectPath } from '@/lib/sessionHelpers';
 import type { Session } from '@/lib/api';
@@ -187,7 +187,7 @@ export const TabManager: React.FC<TabManagerProps> = ({
     // Priority 1: Initial session provided (highest priority)
     if (initialSession) {
       // 🔧 FIX: 检查是否已有相同 session 的标签页
-      const existingTab = tabs.find(t => t.session?.id === initialSession.id);
+      const existingTab = tabs.find(t => sameTabSessionIdentity(t.session, initialSession));
       if (existingTab) {
         switchToTab(existingTab.id);
         return;

@@ -76,15 +76,11 @@ pub async fn trigger_manual_compaction(
 ) -> Result<(), String> {
     info!("Manual compaction triggered for session {}", session_id);
 
-    // Temporarily override custom instructions if provided
-    if let Some(instructions) = custom_instructions {
-        let mut config = state.0.get_config()?;
-        config.custom_instructions = Some(instructions);
-        state.0.update_config(config)?;
-    }
-
-    state.0.execute_compaction(app, &session_id).await?;
-    Ok(())
+    let context = state.0.get_session_stats(&session_id)?.ok_or("Original Claude session is not available")?;
+    let prompt = custom_instructions.filter(|value| !value.trim().is_empty())
+        .map(|value| format!("/compact {value}")).unwrap_or_else(|| "/compact".to_owned());
+    crate::commands::claude::resume_claude_code(app, context.project_path, session_id,
+        prompt, context.model, None, None, None, None).await
 }
 
 /// Get auto-compact configuration

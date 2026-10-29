@@ -15,6 +15,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::process::Stdio;
 use tauri::AppHandle;
@@ -111,34 +112,65 @@ async fn load_recent_history(
     project_id: &str,
     limit: usize,
 ) -> Result<Vec<HistoryMessage>> {
-    let history_file = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
-        .join(".claude")
-        .join("projects")
-        .join(project_id)
-        .join(format!("{}.jsonl", session_id));
-
-    if !history_file.exists() {
-        debug!("History file not found: {:?}", history_file);
+    if limit == 0 {
         return Ok(Vec::new());
     }
-
-    let content = std::fs::read_to_string(&history_file)
-        .map_err(|e| anyhow::anyhow!("Failed to read history file: {}", e))?;
+    let root = super::claude::get_claude_dir()?;
+    let Some(location) =
+        super::claude::project_identity::resolve_optional_session(&root, project_id, session_id)
+            .map_err(anyhow::Error::msg)?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut file = std::fs::File::open(location.path)?;
+    let offset = file.metadata()?.len().saturating_sub(2 * 1024 * 1024);
+    file.seek(SeekFrom::Start(offset))?;
+    let mut reader = std::io::BufReader::new(file);
+    if offset > 0 {
+        reader.read_until(b'\n', &mut Vec::new())?;
+    }
+    let mut content = String::new();
+    reader.read_to_string(&mut content)?;
 
     let mut messages = Vec::new();
     let lines: Vec<&str> = content.lines().collect();
 
     // 读取最后 N 条消息（倒序取）
-    for line in lines.iter().rev().take(limit * 2) {
-        if let Ok(msg) = serde_json::from_str::<HistoryMessage>(line) {
-            // 只保留用户和助手的消息
-            if msg.role == "user" || msg.role == "assistant" {
-                messages.push(msg);
-                if messages.len() >= limit {
-                    break;
-                }
-            }
+    for line in lines.iter().rev() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("isSidechain").and_then(Value::as_bool) == Some(true)
+            || value
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id != session_id)
+        {
+            continue;
+        }
+        let message = value.get("message").unwrap_or(&value);
+        let Some(role @ ("user" | "assistant")) = message.get("role").and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let text = match message.get("content") {
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Array(parts)) => parts
+                .iter()
+                .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+        if !text.is_empty() {
+            messages.push(HistoryMessage {
+                role: role.to_owned(),
+                content: text,
+            });
+        }
+        if messages.len() >= limit.min(100) {
+            break;
         }
     }
 

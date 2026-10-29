@@ -76,6 +76,7 @@ export const Settings: React.FC<SettingsProps> = ({
   const { t } = useTranslation();
   const { goBack } = useNavigation();
   const [settings, setSettings] = useState<ClaudeSettings | null>(null);
+  const [baselineSettings, setBaselineSettings] = useState<ClaudeSettings | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -130,11 +131,13 @@ export const Settings: React.FC<SettingsProps> = ({
       // Ensure loadedSettings is an object
       if (!loadedSettings || typeof loadedSettings !== 'object') {
         console.warn("Loaded settings is not an object:", loadedSettings);
-        setSettings({});
+        setSettings(null);
+        setBaselineSettings(null);
         return;
       }
       
       setSettings(loadedSettings);
+      setBaselineSettings(structuredClone(loadedSettings));
 
       // Load execution config
       try {
@@ -181,8 +184,9 @@ export const Settings: React.FC<SettingsProps> = ({
 
     } catch (err) {
       console.error("Failed to load settings:", err);
-      setError(t('errors.loadFailed'));
-      setSettings({});
+      setError(err instanceof Error ? err.message : String(err));
+      setSettings(null);
+      setBaselineSettings(null);
     } finally {
       setLoading(false);
     }
@@ -197,28 +201,24 @@ export const Settings: React.FC<SettingsProps> = ({
       setError(null);
       setToast(null);
 
-      // 🔥 修复：保存前重新读取最新的 settings.json 以获取当前代理商配置
-      // 这样可以避免用户切换代理商后，保存设置时覆盖刚切换的代理商配置
-      const latestSettings = await api.getClaudeSettings();
-      const latestAnthropicVars = Object.fromEntries(
-        Object.entries(latestSettings?.env || {}).filter(([key]) => key.startsWith('ANTHROPIC_'))
-      );
+      if (!settings || !baselineSettings) {
+        throw new Error(t('errors.loadFailed'));
+      }
 
       // Build the settings object
       const updatedSettings: ClaudeSettings = {
         ...settings,
         permissions: {
+          ...settings.permissions,
           allow: allowRules.map(rule => rule.value).filter(v => v.trim()),
           deny: denyRules.map(rule => rule.value).filter(v => v.trim()),
         },
         env: {
-          // 使用最新读取的 ANTHROPIC_* 变量（这些变量由代理商设置页面管理）
-          ...latestAnthropicVars,
-          // UI 中配置的环境变量完全由用户管理（支持删除）
+          // The backend compares only actual edits against the loaded baseline.
           ...envVars
             .filter(envVar => envVar.enabled) // 只保存启用的环境变量
             .reduce((acc, { key, value }) => {
-              if (key.trim() && value.trim()) {
+              if (key.trim()) {
                 acc[key] = value;
               }
               return acc;
@@ -226,8 +226,13 @@ export const Settings: React.FC<SettingsProps> = ({
         },
       };
 
-      await api.saveClaudeSettings(updatedSettings);
-      setSettings(updatedSettings);
+      await api.saveClaudeSettings(updatedSettings, baselineSettings);
+      const savedSettings = await api.getClaudeSettings();
+      setSettings(savedSettings);
+      setBaselineSettings(structuredClone(savedSettings));
+      setEnvVars(Object.entries(savedSettings.env || {}).map(([key, value], index) => ({
+        id: `saved-env-${index}`, key, value: String(value), enabled: true,
+      })));
 
       // Save execution config if changed
       if (executionConfig) {
@@ -243,15 +248,16 @@ export const Settings: React.FC<SettingsProps> = ({
       // Save user hooks if changed
       if (userHooksChanged && getUserHooks.current) {
         const hooks = getUserHooks.current();
-        await api.updateHooksConfig('user', hooks);
+        await api.updateHooksConfig('user', hooks, undefined, baselineSettings.hooks || {});
         setUserHooksChanged(false);
       }
 
       setToast({ message: t('messages.saved'), type: "success" });
     } catch (err) {
       console.error("Failed to save settings:", err);
-      setError(t('errors.saveFailed'));
-      setToast({ message: t('errors.saveFailed'), type: "error" });
+      const message = err instanceof Error ? err.message : String(err);
+      setError(message);
+      setToast({ message, type: "error" });
     } finally {
       setSaving(false);
     }
@@ -393,7 +399,7 @@ export const Settings: React.FC<SettingsProps> = ({
         
         <Button
           onClick={saveSettings}
-          disabled={saving || loading}
+          disabled={saving || loading || !settings || !baselineSettings}
           size="sm"
           className={cn(
             "gap-2 bg-primary hover:bg-primary/90",

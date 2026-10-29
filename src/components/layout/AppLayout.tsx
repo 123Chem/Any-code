@@ -5,6 +5,7 @@ import { useUpdate } from '@/contexts/UpdateContext';
 import { message } from '@tauri-apps/plugin-dialog';
 import { UpdateDialog } from '@/components/dialogs/UpdateDialog';
 import { AboutDialog } from '@/components/dialogs/AboutDialog';
+import { IS_LOCAL_REPAIR_BUILD } from '@/lib/repair-build';
 
 interface AppLayoutProps {
   children: ReactNode;
@@ -18,6 +19,11 @@ export const AppLayout: React.FC<AppLayoutProps> = ({ children }) => {
 
   const handleCheckUpdate = async () => {
     setShowAboutDialog(false);
+    if (IS_LOCAL_REPAIR_BUILD) {
+      await message('这是 AnyCode 修复版。后续更新请安装你的复刻仓库 Releases 中经过验证的 Windows 安装包：https://github.com/123Chem/Any-code/releases。',
+        { title: '修复版更新', kind: 'info' });
+      return;
+    }
     
     // 强制检查更新
     const hasUpdate = await checkUpdate(true);

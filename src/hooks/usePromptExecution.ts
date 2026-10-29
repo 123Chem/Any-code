@@ -17,7 +17,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { api, type Session } from '@/lib/api';
 import { translationMiddleware, isSlashCommand, type TranslationResult } from '@/lib/translationMiddleware';
 import type { ClaudeStreamMessage } from '@/types/claude';
-import type { ModelType } from '@/components/FloatingPromptInput/types';
+import type { ModelType, ThinkingEffort } from '@/components/FloatingPromptInput/types';
 // 🔧 FIX: 导入 CodexEventConverter 类，在每个会话中创建独立实例避免全局单例污染
 import { CodexEventConverter, extractCodexRateLimitsFromEvent } from '@/lib/codexConverter';
 import type { CodexExecutionMode, CodexRateLimits } from '@/types/codex';
@@ -57,6 +57,8 @@ interface QueuedPrompt {
   id: string;
   prompt: string;
   model: ModelType;
+  maxThinkingTokens?: number;
+  claudeEffort?: ThinkingEffort | null;
 }
 
 interface UsePromptExecutionConfig {
@@ -105,7 +107,7 @@ interface UsePromptExecutionConfig {
 }
 
 interface UsePromptExecutionReturn {
-  handleSendPrompt: (prompt: string, model: ModelType, maxThinkingTokens?: number) => Promise<void>;
+  handleSendPrompt: (prompt: string, model: ModelType, maxThinkingTokens?: number, claudeEffort?: ThinkingEffort | null) => Promise<void>;
 }
 
 type ClaudeGlobalEventPayload<T> = { tab_id?: string | null; payload: T } | T;
@@ -172,6 +174,12 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
   // 解决问题：新建会话并发时全局事件的消息串扰
   // ============================================================================
   const tabIdRef = useRef<string>(crypto.randomUUID());
+  const ownerSessionId = effectiveSession?.id || (executionEngine === 'claude' ? claudeSessionId : null)
+    || extractedSessionInfo?.sessionId || '';
+  const ownerKey = `${executionEngine}\0${projectPath}\0${ownerSessionId}`;
+  const currentOwnerKey = useRef(ownerKey);
+  currentOwnerKey.current = ownerKey;
+  const sendPromptRef = useRef<UsePromptExecutionReturn['handleSendPrompt'] | null>(null);
 
   const codexThreadIdRef = useRef<string | null>(null);
 
@@ -246,8 +254,17 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
   const handleSendPrompt = useCallback(async (
     prompt: string,
     model: ModelType,
-    maxThinkingTokens?: number
+    maxThinkingTokens?: number,
+    claudeEffort?: ThinkingEffort | null,
   ) => {
+    const requestOwnerKey = ownerKey;
+    if (currentOwnerKey.current !== requestOwnerKey) return;
+    function sendQueuedPrompt(nextPrompt: QueuedPrompt, acceptedSessionId: string | null) {
+      const acceptedOwnerKey = `${executionEngine}\0${projectPath}\0${acceptedSessionId || ''}`;
+      if (!isMountedRef.current || (currentOwnerKey.current !== requestOwnerKey
+          && currentOwnerKey.current !== acceptedOwnerKey)) return;
+      sendPromptRef.current?.(nextPrompt.prompt, nextPrompt.model, nextPrompt.maxThinkingTokens, nextPrompt.claudeEffort);
+    }
     // ========================================================================
     // 1️⃣ Validation & Queueing
     // ========================================================================
@@ -265,7 +282,9 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
       const newPrompt: QueuedPrompt = {
         id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
         prompt,
-        model
+        model,
+        maxThinkingTokens,
+        claudeEffort,
       };
       setQueuedPrompts(prev => [...prev, newPrompt]);
       return;
@@ -275,6 +294,11 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
       setIsLoading(true);
       setError(null);
       hasActiveSessionRef.current = true;
+
+      // Freeze the logical Chinese project identity before this worker can emit init.
+      const claudeProjectId = executionEngine === 'claude'
+        ? await api.resolveClaudeProjectIdentity(projectPath) : '';
+      if (currentOwnerKey.current !== requestOwnerKey || !isMountedRef.current) return;
 
       // Record prompt sent (save Git state before sending)
       // Only record real user input, exclude auto Warmup and Skills messages
@@ -511,7 +535,7 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
               setQueuedPrompts(remainingPrompts);
 
               setTimeout(() => {
-                handleSendPrompt(nextPrompt.prompt, nextPrompt.model);
+                sendQueuedPrompt(nextPrompt, currentCodexSessionId);
               }, 100);
             }
           };
@@ -554,7 +578,7 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
               setQueuedPrompts(remainingPrompts);
 
               setTimeout(() => {
-                handleSendPrompt(nextPrompt.prompt, nextPrompt.model);
+                sendQueuedPrompt(nextPrompt, currentCodexSessionId);
               }, 100);
             }
           };
@@ -939,7 +963,7 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
               setQueuedPrompts(remainingPrompts);
 
               setTimeout(() => {
-                handleSendPrompt(nextPrompt.prompt, nextPrompt.model);
+                sendQueuedPrompt(nextPrompt, currentGeminiSessionId);
               }, 100);
             }
           };
@@ -1134,7 +1158,7 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
                 }
                 
                 if (isOurMessage) {
-                  const projectId = extractedSessionInfo?.projectId || projectPath.replace(/[^a-zA-Z0-9]/g, '-');
+                  const projectId = claudeProjectId;
                   // 🔧 FIX: Store Promise to allow processComplete to wait for it
                   pendingClaudePromptRecordingPromise = (async () => {
                     try {
@@ -1220,7 +1244,7 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
           if (recordedPromptIndex >= 0) {
             // Use currentSessionId and extractedSessionInfo for new sessions
             const sessionId = effectiveSession?.id || currentSessionId;
-            const projectId = effectiveSession?.project_id || extractedSessionInfo?.projectId || projectPath.replace(/[^a-zA-Z0-9]/g, '-');
+            const projectId = claudeProjectId;
             
             if (sessionId && projectId) {
               api.markPromptCompleted(
@@ -1246,7 +1270,8 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
           unlistenRefs.current.forEach(u => u && typeof u === 'function' && u());
           unlistenRefs.current = [];
 
-          // Reset currentSessionId to allow detection of new session_id
+          const completedSessionId = currentSessionId;
+          // Reset listener-local state only after retaining the queue's original owner.
           currentSessionId = null;
           // Process queued prompts after completion
           if (queuedPromptsRef.current.length > 0) {
@@ -1255,7 +1280,7 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
 
             // Small delay to ensure UI updates
             setTimeout(() => {
-              handleSendPrompt(nextPrompt.prompt, nextPrompt.model);
+              sendQueuedPrompt(nextPrompt, completedSessionId);
             }, 100);
           }
         };
@@ -1342,13 +1367,13 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
 
                 // If we haven't extracted session info before, do it now
                 if (!extractedSessionInfo) {
-                  const projectId = projectPath.replace(/[^a-zA-Z0-9]/g, '-');
+                  const projectId = claudeProjectId;
                   setExtractedSessionInfo({ sessionId: msg.session_id, projectId, engine: 'claude' });
                 }
 
                 // Record prompt after system:init (user message already written to JSONL)
                 if (!hasRecordedPrompt && isUserInitiated) {
-                  const projectId = projectPath.replace(/[^a-zA-Z0-9]/g, '-');
+                  const projectId = claudeProjectId;
                   // 🔧 FIX: Store Promise to allow processComplete to wait for it
                   pendingClaudePromptRecordingPromise = (async () => {
                     try {
@@ -1395,7 +1420,7 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
               }
               
               if (isOurMessage) {
-                const projectId = extractedSessionInfo?.projectId || projectPath.replace(/[^a-zA-Z0-9]/g, '-');
+                const projectId = claudeProjectId;
                 // 🔧 FIX: Store Promise to allow processComplete to wait for it
                 pendingClaudePromptRecordingPromise = (async () => {
                   try {
@@ -1658,36 +1683,34 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
         // ====================================================================
         // 🔧 Fix: 使用 isPlanModeRef.current 获取最新值，确保批准计划后不带 --plan
         const currentPlanMode = isPlanModeRef.current;
+        if (currentOwnerKey.current !== requestOwnerKey || !isMountedRef.current) return;
         // 🔒 CRITICAL FIX: 传递 tabId 用于全局事件过滤
         const tabId = tabIdRef.current;
-        if (effectiveSession && !isFirstPrompt) {
+        const resumeSessionId = effectiveSession?.id || claudeSessionId || extractedSessionInfo?.sessionId;
+        if (resumeSessionId && !isFirstPrompt) {
           // Resume existing session
-          try {
-            await api.resumeClaudeCode(projectPath, effectiveSession.id, processedPrompt, model, currentPlanMode, maxThinkingTokens, tabId, claudeFastMode);
-          } catch (resumeError) {
-            console.warn('[usePromptExecution] Resume failed, falling back to continue mode:', resumeError);
-            // Fallback to continue mode if resume fails
-            await api.continueClaudeCode(projectPath, processedPrompt, model, currentPlanMode, maxThinkingTokens, tabId, claudeFastMode);
-          }
+          await api.resumeClaudeCode(projectPath, resumeSessionId, processedPrompt, model, currentPlanMode, maxThinkingTokens, tabId, claudeFastMode, claudeEffort);
         } else {
           // Start new session
           setIsFirstPrompt(false);
-          await api.executeClaudeCode(projectPath, processedPrompt, model, currentPlanMode, maxThinkingTokens, tabId, claudeFastMode);
+          await api.executeClaudeCode(projectPath, processedPrompt, model, currentPlanMode, maxThinkingTokens, tabId, claudeFastMode, claudeEffort);
         }
       }
 
     } catch (err) {
+      if (currentOwnerKey.current !== requestOwnerKey || !isMountedRef.current) return;
       // ========================================================================
       // 7️⃣ Error Handling
       // ========================================================================
       console.error("Failed to send prompt:", err);
-      setError("发送提示失败");
+      setError(err instanceof Error ? err.message : String(err));
       setIsLoading(false);
       hasActiveSessionRef.current = false;
       // Reset session state on error
-      setClaudeSessionId(null);
+      // Preserve the selected UUID so a failed send cannot become a new conversation.
     }
   }, [
+    ownerKey,
     projectPath,
     isLoading,
     claudeSessionId,
@@ -1722,6 +1745,7 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
     refreshCodexRateLimitsFromHistory,
     updateCodexRateLimits
   ]);
+  sendPromptRef.current = handleSendPrompt;
 
   // ============================================================================
   // Return Hook Interface

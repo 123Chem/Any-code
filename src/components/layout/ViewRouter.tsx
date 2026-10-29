@@ -427,6 +427,7 @@ export const ViewRouter: React.FC = () => {
           <ClaudeCodeSession
             session={viewParams.initialSession}
             initialProjectPath={viewParams.initialProjectPath}
+            draftScope={`view-session:${viewParams.initialProjectPath || viewParams.initialSession?.project_path || 'unbound'}`}
             onStreamingChange={(isStreaming) => {
               // Navigation protection
               if (isStreaming) {

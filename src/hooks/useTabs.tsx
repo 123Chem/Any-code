@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef, useContext, createContext, ReactNode, useEffect } from 'react';
-import type { Session } from '@/lib/api';
+import { api, type Session } from '@/lib/api';
 import { createSessionWindow, emitWindowSyncEvent, onWindowSyncEvent, isSessionWindow } from '@/lib/windowManager';
 
 /**
@@ -49,6 +49,7 @@ interface TabContextValue {
   updateTabState: (tabId: string, state: Tab['state'], errorMessage?: string) => void;
   updateTabChanges: (tabId: string, hasChanges: boolean) => void;
   updateTabTitle: (tabId: string, title: string) => void;
+  updateTabProjectPath: (tabId: string, projectPath: string) => void;
   updateTabEngine: (tabId: string, engine: 'claude' | 'codex' | 'gemini') => void;
   /** 🔧 FIX: 更新标签页的 session 信息（用于新建会话获取到 sessionId 后持久化） */
   updateTabSession: (tabId: string, sessionInfo: { sessionId: string; projectId: string; projectPath: string; engine?: 'claude' | 'codex' | 'gemini' }) => void;
@@ -76,6 +77,20 @@ interface TabContextValue {
 
 const TabContext = createContext<TabContextValue | null>(null);
 
+export const normalizeTabProjectPath = (path?: string): string => {
+  let value = (path || '').replace(/\\/g, '/');
+  if (value.startsWith('//?/UNC/')) value = `//${value.slice(8)}`;
+  else if (value.startsWith('//?/')) value = value.slice(4);
+  return value.replace(/\/+$/, '').toLowerCase();
+};
+
+export const sameTabSessionIdentity = (first: Session | undefined, second: Session): boolean => {
+  if (!first || first.id !== second.id || (first.engine || 'claude') !== (second.engine || 'claude')) return false;
+  const firstPath = normalizeTabProjectPath(first.project_path);
+  const secondPath = normalizeTabProjectPath(second.project_path);
+  return firstPath === secondPath && (Boolean(firstPath) || first.project_id === second.project_id);
+};
+
 interface TabProviderProps {
   children: ReactNode;
 }
@@ -90,6 +105,7 @@ export const TabProvider: React.FC<TabProviderProps> = ({ children }) => {
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const nextTabId = useRef(1);
+  const [restored, setRestored] = useState(false);
   
   // Cleanup callbacks stored separately (not in state)
   const cleanupCallbacksRef = useRef<Map<string, () => Promise<void> | void>>(new Map());
@@ -98,49 +114,60 @@ export const TabProvider: React.FC<TabProviderProps> = ({ children }) => {
 
   // ✨ REFACTORED: Load persisted state on mount (simplified)
   useEffect(() => {
-    try {
-      const persistedState = localStorage.getItem(STORAGE_KEY);
-      if (!persistedState) return;
-      
-      const { tabs: savedTabs, activeTabId: savedActiveTabId } = JSON.parse(persistedState);
-      
-      if (!Array.isArray(savedTabs)) return;
-      
-      // Validate and filter tabs
-      const validTabs = savedTabs.filter((tab: any) => {
-        if (!tab.id || !tab.title) {
-          console.warn('[useTabs] Skipping invalid tab:', tab);
-          return false;
-        }
-        return true;
-      }).map((tab: any) => ({
-        ...tab,
-        type: tab.type || (tab.session ? 'session' : 'new'),
-        state: tab.state || 'idle',
-        hasUnsavedChanges: tab.hasUnsavedChanges ?? tab.hasChanges ?? false,
-      }));
-      
-      // Validate activeTabId
-      const validActiveTabId = validTabs.find(t => t.id === savedActiveTabId)
-        ? savedActiveTabId
-        : (validTabs[0]?.id || null);
-      
-      setTabs(validTabs);
-      setActiveTabId(validActiveTabId);
-    } catch (error) {
-      console.error('[useTabs] Failed to restore tabs:', error);
-      localStorage.removeItem(STORAGE_KEY);
-    }
+    let current = true;
+    const restoreTabs = async () => {
+      try {
+        const persistedState = localStorage.getItem(STORAGE_KEY);
+        if (!persistedState) return;
+        const backupKey = `${STORAGE_KEY}-before-project-identity-v1`;
+        if (!localStorage.getItem(backupKey)) localStorage.setItem(backupKey, persistedState);
+        const { tabs: savedTabs, activeTabId: savedActiveTabId } = JSON.parse(persistedState);
+        if (!Array.isArray(savedTabs)) return;
+        const validTabs: Tab[] = await Promise.all(savedTabs
+          .filter((tab: any) => typeof tab.id === 'string' && typeof tab.title === 'string')
+          .map(async (saved: any): Promise<Tab> => {
+            const tab: Tab = { ...saved, type: saved.type || (saved.session ? 'session' : 'new'),
+              state: saved.state === 'error' ? 'error' : 'idle',
+              hasUnsavedChanges: saved.hasUnsavedChanges ?? saved.hasChanges ?? false };
+            if (!tab.session || (tab.session.engine || tab.engine || 'claude') !== 'claude') return tab;
+            try {
+              const owner = await api.resolveClaudeSessionIdentity(tab.session.id, tab.session.project_id);
+              const previousName = tab.session.project_path?.split(/[/\\]/).filter(Boolean).pop();
+              return { ...tab, projectPath: owner.project_path,
+                title: tab.title === previousName && owner.project_verified
+                  ? owner.project_path.split(/[/\\]/).filter(Boolean).pop() || tab.title : tab.title,
+                session: { ...tab.session, project_id: owner.project_id, project_path: owner.project_path },
+                state: owner.project_verified ? 'idle' : 'error',
+                errorMessage: owner.project_verified ? undefined : '原会话工作目录尚未确认，只能查看历史，请刷新原项目后续聊' };
+            } catch (error) {
+              return { ...tab, projectPath: '', session: { ...tab.session, project_path: '' },
+                state: 'error', errorMessage: String(error) };
+            }
+          }));
+        if (!current) return;
+        setTabs(previous => [...validTabs.filter(saved => !previous.some(tab => tab.id === saved.id
+          || (saved.session && sameTabSessionIdentity(tab.session, saved.session)))), ...previous]);
+        setActiveTabId(previous => previous || (validTabs.some(tab => tab.id === savedActiveTabId)
+          ? savedActiveTabId : validTabs[0]?.id || null));
+      } catch (error) {
+        console.error('[useTabs] Failed to restore tabs; original metadata remains in its backup:', error);
+      } finally {
+        if (current) setRestored(true);
+      }
+    };
+    void restoreTabs();
+    return () => { current = false; };
   }, []);
 
-  // ✨ REFACTORED: Persist state when it changes (simplified)
+  // Wait for identity verification before overwriting the old saved tab metadata.
   useEffect(() => {
+    if (!restored) return;
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ tabs, activeTabId }));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ schema: 2, tabs, activeTabId }));
     } catch (error) {
       console.error('[useTabs] Failed to persist tabs:', error);
     }
-  }, [tabs, activeTabId]);
+  }, [tabs, activeTabId, restored]);
 
   // ✨ REFACTORED: Compute TabSession with isActive (simplified)
   const tabsWithActive: TabSession[] = tabs.map(tab => ({
@@ -312,6 +339,14 @@ export const TabProvider: React.FC<TabProviderProps> = ({ children }) => {
   }, []);
 
   // 🆕 Update tab engine - 更新标签页的执行引擎
+  const updateTabProjectPath = useCallback((tabId: string, projectPath: string) => {
+    setTabs(prev => prev.map(tab => {
+      if (tab.id !== tabId) return tab;
+      if (tab.session && normalizeTabProjectPath(tab.session.project_path) !== normalizeTabProjectPath(projectPath)) return tab;
+      return { ...tab, projectPath };
+    }));
+  }, []);
+
   const updateTabEngine = useCallback((tabId: string, engine: 'claude' | 'codex' | 'gemini') => {
     setTabs(prev =>
       prev.map(tab => {
@@ -332,15 +367,27 @@ export const TabProvider: React.FC<TabProviderProps> = ({ children }) => {
       prev.map(tab => {
         if (tab.id !== tabId) return tab;
 
-        // 如果已经有 session 且 id 相同，不需要更新
-        if (tab.session?.id === sessionInfo.sessionId) return tab;
+        // An established tab cannot adopt a late event for another UUID, engine or cwd.
+        if (!tab.session && ((tab.projectPath && normalizeTabProjectPath(tab.projectPath) !== normalizeTabProjectPath(sessionInfo.projectPath))
+          || (tab.engine || 'claude') !== (sessionInfo.engine || 'claude') || !sessionInfo.projectPath)) {
+          console.warn('[useTabs] Rejected first session info outside the selected tab project or engine:', tabId);
+          return tab;
+        }
+        if (tab.session && !sameTabSessionIdentity(tab.session, {
+          id: sessionInfo.sessionId, project_id: sessionInfo.projectId, project_path: sessionInfo.projectPath,
+          created_at: tab.session.created_at, engine: sessionInfo.engine || tab.engine,
+        })) {
+          console.warn('[useTabs] Rejected session info that belongs to another tab owner:', tabId);
+          return tab;
+        }
 
         // 构建完整的 Session 对象
         const newSession: Session = {
+          ...tab.session,
           id: sessionInfo.sessionId,
           project_id: sessionInfo.projectId,
           project_path: sessionInfo.projectPath,
-          created_at: tab.createdAt,
+          created_at: tab.session?.created_at || Math.floor(tab.createdAt / 1000),
           engine: sessionInfo.engine || tab.engine,
         };
 
@@ -377,7 +424,7 @@ export const TabProvider: React.FC<TabProviderProps> = ({ children }) => {
 
   // Open session in background
   const openSessionInBackground = useCallback((session: Session): { tabId: string; isNew: boolean } => {
-    const existingTab = tabs.find(tab => tab.session?.id === session.id);
+    const existingTab = tabs.find(tab => sameTabSessionIdentity(tab.session, session));
     if (existingTab) {
       return { tabId: existingTab.id, isNew: false };
     }
@@ -421,69 +468,55 @@ export const TabProvider: React.FC<TabProviderProps> = ({ children }) => {
     if (isSessionWindow()) return;
 
     let unlisten: (() => void) | null = null;
+    let current = true;
 
     const setupListener = async () => {
-      unlisten = await onWindowSyncEvent((event) => {
+      const stop = await onWindowSyncEvent(async (event) => {
+        if (!current) return;
         if (event.type === 'tab_attached') {
           // A detached window wants to merge back to main window
           // Remove from detached set
           detachedTabsRef.current.delete(event.tabId);
 
           // Create new tab with the session data
-          const session = event.data?.session as Session | undefined;
-          const projectPath = event.projectPath;
-
-          if (session) {
-            // Create tab with existing session
-            setTabs(prev => {
-              // Check if tab already exists
-              if (prev.some(t => t.session?.id === session.id)) {
-                return prev;
-              }
-
-              const newTab: Tab = {
-                id: `tab-${Date.now()}-attached`,
-                title: projectPath?.split(/[/\\]/).pop() || session.id.slice(0, 8),
-                type: 'session',
-                projectPath: projectPath || session.project_path,
-                session,
-                state: 'idle',
-                hasUnsavedChanges: false,
-                createdAt: Date.now(),
-                lastActiveAt: Date.now(),
-              };
-
-              return [...prev, newTab];
-            });
-
-            // Activate the new tab
-            setActiveTabId(`tab-${Date.now()}-attached`);
-          } else if (projectPath) {
-            // Create new tab with project path only
-            setTabs(prev => {
-              const newTab: Tab = {
-                id: `tab-${Date.now()}-attached`,
-                title: projectPath.split(/[/\\]/).pop() || '新会话',
-                type: 'new',
-                projectPath,
-                state: 'idle',
-                hasUnsavedChanges: false,
-                createdAt: Date.now(),
-                lastActiveAt: Date.now(),
-              };
-
-              return [...prev, newTab];
-            });
-
-            setActiveTabId(`tab-${Date.now()}-attached`);
+          let session = event.data?.session as Session | undefined;
+          let projectPath = event.projectPath || session?.project_path;
+          if (session && (session.engine || 'claude') === 'claude') {
+            try {
+              const owner = await api.resolveClaudeSessionIdentity(session.id, session.project_id);
+              if (!current) return;
+              session = { ...session, project_id: owner.project_id, project_path: owner.project_path };
+              projectPath = owner.project_path;
+            } catch (error) {
+              console.warn('[useTabs] Detached session ownership could not be confirmed:', error);
+              return;
+            }
           }
+          if (!session && !projectPath) return;
+          const newTabId = event.tabId || `tab-${Date.now()}-attached`;
+          const incomingSession = session;
+          const newTab: Tab = { id: newTabId,
+            title: projectPath?.split(/[/\\]/).filter(Boolean).pop() || session?.id.slice(0, 8) || '新会话',
+            type: session ? 'session' : 'new', projectPath, session, engine: session?.engine,
+            state: session && !projectPath ? 'error' : 'idle', hasUnsavedChanges: false,
+            createdAt: Date.now(), lastActiveAt: Date.now() };
+          setTabs(prev => {
+            const byId = prev.find(tab => tab.id === newTabId);
+            if (byId && incomingSession && !sameTabSessionIdentity(byId.session, incomingSession)) return prev;
+            const existing = byId || (incomingSession && prev.find(tab => sameTabSessionIdentity(tab.session, incomingSession)));
+            setActiveTabId(existing?.id || newTabId);
+            return existing ? prev : [...prev, newTab];
+          });
         }
       });
+      if (!current) stop();
+      else unlisten = stop;
     };
 
     setupListener();
 
     return () => {
+      current = false;
       if (unlisten) unlisten();
     };
   }, []);
@@ -507,6 +540,7 @@ export const TabProvider: React.FC<TabProviderProps> = ({ children }) => {
       const windowLabel = await createSessionWindow({
         tabId: tab.id,
         sessionId: tab.session?.id,
+        projectId: tab.session?.project_id,
         projectPath: tab.projectPath,
         title: `${tab.title} - Any Code`,
         engine: tab.session?.engine,
@@ -554,6 +588,7 @@ export const TabProvider: React.FC<TabProviderProps> = ({ children }) => {
       const windowLabel = await createSessionWindow({
         tabId: newTabId,
         sessionId: session?.id,
+        projectId: session?.project_id,
         projectPath: projectPath || session?.project_path,
         title: `${title} - Any Code`,
         engine: session?.engine,
@@ -594,6 +629,7 @@ export const TabProvider: React.FC<TabProviderProps> = ({ children }) => {
     updateTabState,
     updateTabChanges,
     updateTabTitle,
+    updateTabProjectPath,
     updateTabEngine,
     updateTabSession,
     getTabById,
@@ -644,7 +680,7 @@ export const useActiveTab = (): TabSession | undefined => {
  * useTabSession - 获取特定标签页的会话管理钩子
  */
 export const useTabSession = (tabId: string) => {
-  const { getTabById, updateTabChanges, updateTabStreamingStatus, updateTabTitle, updateTabEngine, updateTabSession, registerTabCleanup } = useTabs();
+  const { getTabById, updateTabChanges, updateTabStreamingStatus, updateTabTitle, updateTabProjectPath, updateTabEngine, updateTabSession, registerTabCleanup } = useTabs();
 
   const tab = getTabById(tabId);
 
@@ -663,6 +699,10 @@ export const useTabSession = (tabId: string) => {
   const updateStreaming = useCallback((isStreaming: boolean, sessionId: string | null) => {
     updateTabStreamingStatus(tabId, isStreaming, sessionId);
   }, [tabId, updateTabStreamingStatus]);
+
+  const updateProjectPath = useCallback((projectPath: string) => {
+    updateTabProjectPath(tabId, projectPath);
+  }, [tabId, updateTabProjectPath]);
 
   // 🆕 Update engine - 更新执行引擎
   const updateEngine = useCallback((engine: 'claude' | 'codex' | 'gemini') => {
@@ -684,6 +724,7 @@ export const useTabSession = (tabId: string) => {
     markAsChanged,
     markAsUnchanged,
     updateTitle,
+    updateProjectPath,
     updateStreaming,
     updateEngine,
     updateSession,

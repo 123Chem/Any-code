@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useCallback, useEffect, ReactNode } from 'react';
+import React, { createContext, useContext, useState, useCallback, useEffect, useRef, ReactNode } from 'react';
 import { api, Project, Session } from '@/lib/api';
 import { useTranslation } from 'react-i18next';
 
@@ -24,8 +24,12 @@ export const ProjectProvider: React.FC<{ children: ReactNode }> = ({ children })
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const projectRequest = useRef(0);
+  const sessionRequest = useRef(0);
+  const selectedProjectRef = useRef<Project | null>(null);
 
   const loadProjects = useCallback(async () => {
+    const request = ++projectRequest.current;
     try {
       setLoading(true);
       setError(null);
@@ -82,102 +86,76 @@ export const ProjectProvider: React.FC<{ children: ReactNode }> = ({ children })
         return timeB - timeA;
       });
 
-      setProjects(sortedList);
+      if (request === projectRequest.current) setProjects(sortedList);
     } catch (err) {
       console.error("Failed to load projects:", err);
-      setError(t('common.loadingProjects'));
+      if (request === projectRequest.current) setError(t('common.loadingProjects'));
     } finally {
-      setLoading(false);
+      if (request === projectRequest.current) setLoading(false);
     }
   }, [t]);
 
+  const loadSessionsForProject = useCallback(async (project: Project): Promise<Session[]> => {
+    const [claudeCodex, gemini] = await Promise.allSettled([
+      api.getProjectSessions(project.id, project.path),
+      project.path ? api.listGeminiSessions(project.path) : Promise.resolve([]),
+    ]);
+    if (claudeCodex.status === 'rejected') throw claudeCodex.reason;
+    const geminiSessions: Session[] = gemini.status === 'fulfilled' ? gemini.value.map(info => ({
+      id: info.sessionId, project_id: project.id, project_path: project.path,
+      created_at: new Date(info.startTime).getTime() / 1000, first_message: info.firstMessage,
+      message_timestamp: info.startTime, last_message_timestamp: info.startTime, engine: 'gemini' as const,
+    })) : [];
+    if (gemini.status === 'rejected') console.warn('[ProjectContext] Failed to load Gemini sessions:', gemini.reason);
+    return [...claudeCodex.value, ...geminiSessions];
+  }, []);
+
   const selectProject = useCallback(async (project: Project) => {
+    const request = ++sessionRequest.current;
+    selectedProjectRef.current = project;
+    setSelectedProject(project);
+    setSessions([]);
     try {
       setLoading(true);
       setError(null);
 
-      // Load Claude/Codex sessions
-      const claudeCodexSessions = await api.getProjectSessions(project.id, project.path);
-
-      // Load Gemini sessions
-      let geminiSessions: Session[] = [];
-      try {
-        const geminiSessionInfos = await api.listGeminiSessions(project.path);
-
-        // Convert GeminiSessionInfo to Session format
-        geminiSessions = geminiSessionInfos.map(info => ({
-          id: info.sessionId,
-          project_id: project.id,
-          project_path: project.path,
-          created_at: new Date(info.startTime).getTime() / 1000, // Convert to Unix timestamp
-          first_message: info.firstMessage,
-          message_timestamp: info.startTime,
-          last_message_timestamp: info.startTime,
-          engine: 'gemini' as const,
-        }));
-      } catch (geminiErr) {
-        console.warn('[ProjectContext] Failed to load Gemini sessions (may not exist):', geminiErr);
-        // Continue without Gemini sessions if loading fails
-      }
-
-      // Merge all sessions
-      const allSessions = [...claudeCodexSessions, ...geminiSessions];
-      
-
+      const allSessions = await loadSessionsForProject(project);
+      if (request !== sessionRequest.current) return;
       setSessions(allSessions);
-      setSelectedProject(project);
-
-      // Background indexing
-      api.preindexProject(project.path).catch(console.error);
+      if (project.path) api.preindexProject(project.path).catch(console.error);
     } catch (err) {
-      console.error("Failed to load sessions:", err);
-      setError(t('common.loadingSessions'));
+      if (request === sessionRequest.current) {
+        console.error("Failed to load sessions:", err);
+        setError(String(err));
+      }
     } finally {
-      setLoading(false);
+      if (request === sessionRequest.current) setLoading(false);
     }
-  }, [t]);
+  }, [loadSessionsForProject]);
 
   const refreshSessions = useCallback(async () => {
-    if (selectedProject) {
+    const selected = selectedProjectRef.current;
+    if (selected) {
+      const request = ++sessionRequest.current;
       try {
-        // Load Claude/Codex sessions
-        const claudeCodexSessions = await api.getProjectSessions(selectedProject.id, selectedProject.path);
-
-        // Load Gemini sessions
-        let geminiSessions: Session[] = [];
-        try {
-          const geminiSessionInfos = await api.listGeminiSessions(selectedProject.path);
-
-          // Convert GeminiSessionInfo to Session format
-          geminiSessions = geminiSessionInfos.map(info => ({
-            id: info.sessionId,
-            project_id: selectedProject.id,
-            project_path: selectedProject.path,
-            created_at: new Date(info.startTime).getTime() / 1000,
-            first_message: info.firstMessage,
-            message_timestamp: info.startTime,
-            last_message_timestamp: info.startTime,
-            engine: 'gemini' as const,
-          }));
-        } catch (geminiErr) {
-          console.warn('[ProjectContext] Failed to refresh Gemini sessions:', geminiErr);
+        const allSessions = await loadSessionsForProject(selected);
+        if (request === sessionRequest.current && selectedProjectRef.current?.id === selected.id) {
+          setSessions(allSessions);
         }
-
-        // Merge all sessions
-        const allSessions = [...claudeCodexSessions, ...geminiSessions];
-        setSessions(allSessions);
       } catch (err) {
         console.error("Failed to refresh sessions:", err);
       }
     }
-  }, [selectedProject]);
+  }, [loadSessionsForProject]);
 
   const deleteProject = useCallback(async (project: Project) => {
     try {
       setLoading(true);
       await api.deleteProject(project.id);
       await loadProjects();
-      if (selectedProject?.id === project.id) {
+      if (selectedProjectRef.current?.id === project.id) {
+        ++sessionRequest.current;
+        selectedProjectRef.current = null;
         setSelectedProject(null);
         setSessions([]);
       }
@@ -187,11 +165,14 @@ export const ProjectProvider: React.FC<{ children: ReactNode }> = ({ children })
     } finally {
       setLoading(false);
     }
-  }, [loadProjects, selectedProject]);
+  }, [loadProjects]);
 
   const clearSelection = useCallback(() => {
+    ++sessionRequest.current;
+    selectedProjectRef.current = null;
     setSelectedProject(null);
     setSessions([]);
+    setLoading(false);
   }, []);
 
   // Load projects on mount

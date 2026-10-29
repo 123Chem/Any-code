@@ -101,7 +101,7 @@ pub(super) fn map_model_to_claude_alias(model: &str) -> String {
 
 /// Helper function to create a tokio Command with proper environment variables
 /// This ensures commands like Claude can find Node.js and other dependencies
-fn create_command_with_env(program: &str) -> Command {
+fn create_command_with_env(program: &str) -> Result<Command, String> {
     // On Windows, if the program is a .cmd file, try to resolve it to direct Node.js invocation
     // This prevents the cmd.exe window from appearing
     #[cfg(target_os = "windows")]
@@ -161,7 +161,7 @@ fn create_command_with_env(program: &str) -> Command {
             || key.starts_with("CLAUDE_CODE_")
             || key == "API_TIMEOUT_MS"
         {
-            log::debug!("Inheriting env var: {}={}", key, value);
+            log::debug!("Inheriting environment variable: {}", key);
             tokio_cmd.env(&key, &value);
         }
     }
@@ -184,31 +184,16 @@ fn create_command_with_env(program: &str) -> Command {
         }
     }
 
-    // 🔥 新增：读取 ~/.claude/settings.json 中的自定义环境变量
-    // 这些变量会覆盖系统环境变量，确保用户的自定义配置生效
-    if let Ok(claude_dir) = get_claude_dir() {
-        let settings_path = claude_dir.join("settings.json");
-        if settings_path.exists() {
-            if let Ok(content) = fs::read_to_string(&settings_path) {
-                if let Ok(settings) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if let Some(env_obj) = settings.get("env").and_then(|v| v.as_object()) {
-                        log::info!(
-                            "Loading {} custom environment variables from settings.json",
-                            env_obj.len()
-                        );
-                        for (key, value) in env_obj {
-                            if let Some(value_str) = value.as_str() {
-                                log::info!("Setting custom env var: {}={}", key, value_str);
-                                tokio_cmd.env(key, value_str);
-                            }
-                        }
-                    }
-                }
-            }
+    // A broken shared file must be reported before launching, not silently lose auth.
+    let settings_path = get_claude_dir().map_err(|error| error.to_string())?.join("settings.json");
+    let settings = super::settings_store::read(&settings_path)?;
+    if let Some(env) = settings.get("env").and_then(|value| value.as_object()) {
+        log::info!("Loading {} validated Claude environment variables", env.len());
+        for (key, value) in env {
+            tokio_cmd.env(key, value.as_str().expect("settings env was validated"));
         }
     }
-
-    tokio_cmd
+    Ok(tokio_cmd)
 }
 
 /// Helper function to spawn Claude process and handle streaming
@@ -233,7 +218,7 @@ fn create_windows_command(
     model: Option<&str>,
     fast_mode: bool,
 ) -> Result<Command, String> {
-    let mut cmd = create_command_with_env(claude_path);
+    let mut cmd = create_command_with_env(claude_path)?;
 
     // 🔥 修复：设置ANTHROPIC_MODEL环境变量以确保模型选择生效
     if let Some(model_name) = model {
@@ -249,8 +234,7 @@ fn create_windows_command(
         cmd.env("CLAUDE_CODE_FAST_MODE", "1");
     }
 
-    // Note: MAX_THINKING_TOKENS is now controlled via settings.json env field
-    // See update_thinking_mode command for managing this setting
+    // Session effort is applied after shared defaults, immediately before spawn.
 
     // Add all arguments
     cmd.args(&args);
@@ -291,6 +275,7 @@ pub async fn execute_claude_code(
     max_thinking_tokens: Option<u32>,
     tab_id: Option<String>,
     fast_mode: Option<bool>,
+    effort: Option<super::session_policy::ClaudeEffortOverride>,
 ) -> Result<(), String> {
     let plan_mode = plan_mode.unwrap_or(false);
     let fast_mode = fast_mode.unwrap_or(false);
@@ -347,7 +332,7 @@ pub async fn execute_claude_code(
         fast_mode,
         max_thinking_tokens,
     )?;
-    spawn_claude_process(app, cmd, prompt, model, project_path, tab_id).await
+    spawn_claude_process(app, cmd, prompt, model, project_path, tab_id, effort).await
 }
 
 /// Continue an existing Claude Code conversation with streaming output
@@ -362,6 +347,8 @@ pub async fn continue_claude_code(
     max_thinking_tokens: Option<u32>,
     tab_id: Option<String>,
     fast_mode: Option<bool>,
+    session_id: Option<String>,
+    effort: Option<super::session_policy::ClaudeEffortOverride>,
 ) -> Result<(), String> {
     let plan_mode = plan_mode.unwrap_or(false);
     let fast_mode = fast_mode.unwrap_or(false);
@@ -400,7 +387,7 @@ pub async fn continue_claude_code(
         execution_config.max_thinking_tokens
     );
 
-    // 使用新的参数构建函数，添加 -c 标志用于继续对话（先映射模型名称）
+    // Continue with the explicit original UUID; never adopt the latest project session.
     // 🔥 修复：prompt 不再通过命令行参数传递，改为 stdin 管道传递
     let mapped_model = if fast_mode {
         "opus".to_string()
@@ -409,8 +396,9 @@ pub async fn continue_claude_code(
     };
     let mut args = build_execution_args(&execution_config, &mapped_model);
 
-    // 在开头插入 -c 标志
-    args.insert(0, "-c".to_string());
+    let session_id = session_id.ok_or("Continuing Claude requires the original session UUID; select that session before retrying")?;
+    args.insert(0, "--resume".to_string());
+    args.insert(1, session_id);
 
     // Create command
     let cmd = create_system_command(
@@ -421,7 +409,7 @@ pub async fn continue_claude_code(
         fast_mode,
         max_thinking_tokens,
     )?;
-    spawn_claude_process(app, cmd, prompt, model, project_path, tab_id).await
+    spawn_claude_process(app, cmd, prompt, model, project_path, tab_id, effort).await
 }
 
 /// Resume an existing Claude Code session by ID with streaming output
@@ -437,6 +425,7 @@ pub async fn resume_claude_code(
     max_thinking_tokens: Option<u32>,
     tab_id: Option<String>,
     fast_mode: Option<bool>,
+    effort: Option<super::session_policy::ClaudeEffortOverride>,
 ) -> Result<(), String> {
     let plan_mode = plan_mode.unwrap_or(false);
     let fast_mode = fast_mode.unwrap_or(false);
@@ -512,37 +501,7 @@ pub async fn resume_claude_code(
         max_thinking_tokens,
     )?;
 
-    // Try to spawn the process - if it fails, fall back to continue mode
-    match spawn_claude_process(
-        app.clone(),
-        cmd,
-        prompt.clone(),
-        model.clone(),
-        project_path.clone(),
-        tab_id.clone(),
-    )
-    .await
-    {
-        Ok(_) => Ok(()),
-        Err(resume_error) => {
-            log::warn!(
-                "Resume failed: {}, trying continue mode as fallback",
-                resume_error
-            );
-            // Fallback to continue mode
-            continue_claude_code(
-                app,
-                project_path,
-                prompt,
-                model,
-                Some(plan_mode),
-                max_thinking_tokens,
-                tab_id,
-                Some(fast_mode),
-            )
-            .await
-        }
-    }
+    spawn_claude_process(app, cmd, prompt, model, project_path, tab_id, effort).await
 }
 
 /// Cancel the currently running Claude Code execution
@@ -868,6 +827,7 @@ async fn spawn_claude_process(
     model: String,
     project_path: String,
     tab_id: Option<String>,
+    effort: Option<super::session_policy::ClaudeEffortOverride>,
 ) -> Result<(), String> {
     use std::sync::Mutex;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -919,10 +879,17 @@ async fn spawn_claude_process(
         cmd.arg("-p");
     }
 
+    let prepared = Arc::new(super::session_policy::prepare(&mut cmd, &project_path, effort)?);
+
+    // The lease belongs to this child and survives until both streams and wait finish.
     // Spawn the process
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn Claude: {}", e))?;
+    if let Ok(policy) = super::session_policy::get_claude_session_policy(
+        prepared.session_id.clone(), project_path.clone()) {
+        let _ = app.emit("claude-native-policy", policy);
+    }
 
     // 🔥 通过 stdin 管道写入载荷，避免命令行长度限制
     // 斜杠命令已通过 -p 参数传递 prompt（stdin_payload 为 None），只需关闭 stdin
@@ -1053,6 +1020,7 @@ async fn spawn_claude_process(
     // 🔧 FIX: Clone job_object_holder for passing to register_claude_session
     #[cfg(windows)]
     let job_object_holder_clone = job_object_holder.clone();
+    let prepared_stdout = prepared.clone();
     let stdout_task = tokio::spawn(async move {
         let mut lines = stdout_reader.lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -1061,6 +1029,21 @@ async fn spawn_claude_process(
 
             // Parse the line to check for init message with session ID
             if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) {
+                match super::session_policy::observe(&prepared_stdout, &msg) {
+                    Ok(true) => {
+                        if let Ok(policy) = super::session_policy::get_claude_session_policy(
+                            prepared_stdout.session_id.clone(), project_path_clone.clone()) {
+                            let _ = app_handle.emit("claude-native-policy", policy);
+                        }
+                    }
+                    Err(error) => {
+                        let payload = serde_json::json!({"tab_id":tab_id_for_stdout,"payload":error});
+                        let _ = app_handle.emit("claude-error", payload);
+                        if pid != 0 { let _ = platform::kill_process_tree(pid); }
+                        break;
+                    }
+                    Ok(false) => {}
+                }
                 if msg["type"] == "system" && msg["subtype"] == "init" {
                     if let Some(claude_session_id) = msg["session_id"].as_str() {
                         let mut session_id_guard = session_id_holder_clone.lock().unwrap();
@@ -1237,13 +1220,20 @@ async fn spawn_claude_process(
     let last_spawned_pid = claude_state.last_spawned_pid.clone();
     // 🔒 CRITICAL FIX: 克隆 tab_id 用于 complete 事件
     let tab_id_for_complete = tab_id;
+    let project_path_for_policy = project_path.clone();
     tokio::spawn(async move {
         let _ = stdout_task.await;
         let _ = stderr_task.await;
 
         // 🔒 CRITICAL FIX: 直接等待 child，不再从全局 state 取出
         // child 已经被移动到这个 async block 中
-        match child.wait().await {
+        let exit_status = child.wait().await;
+        let policy_session = prepared.session_id.clone();
+        drop(prepared);
+        if let Ok(policy) = super::session_policy::get_claude_session_policy(policy_session, project_path_for_policy) {
+            let _ = app_handle_wait.emit("claude-native-policy", policy);
+        }
+        match exit_status {
             Ok(status) => {
                 log::info!("Claude process exited with status: {}", status);
                 // Add a small delay to ensure all messages are processed

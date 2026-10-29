@@ -80,17 +80,25 @@ export const RunningClaudeSessions: React.FC<RunningClaudeSessionsProps> = ({
     }
   };
 
-  const handleResumeSession = (processInfo: ProcessInfo) => {
+  const handleResumeSession = async (processInfo: ProcessInfo) => {
     // Extract session ID from process type
     if ('ClaudeSession' in processInfo.process_type) {
       const sessionId = processInfo.process_type.ClaudeSession.session_id;
       
-      // Create a minimal session object for resumption
+      let projectId: string;
+      try {
+        projectId = await api.resolveClaudeProjectIdentity(processInfo.project_path);
+      } catch (error) {
+        setError(String(error));
+        return;
+      }
+      // The process owns a real cwd; its UI identity never comes from a lossy slug.
       const session: Session = {
         id: sessionId,
-        project_id: processInfo.project_path.replace(/[^a-zA-Z0-9]/g, '-'),
+        project_id: projectId,
         project_path: processInfo.project_path,
         created_at: new Date(processInfo.started_at).getTime() / 1000,
+        engine: 'claude',
       };
 
       onSessionClick?.(session);

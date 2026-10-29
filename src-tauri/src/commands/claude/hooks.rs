@@ -42,22 +42,13 @@ pub async fn get_hooks_config(
         return Ok(serde_json::json!({}));
     }
 
-    let content = fs::read_to_string(&settings_path)
-        .map_err(|e| format!("Failed to read settings: {}", e))?;
-
-    log::debug!("Settings file content length: {} bytes", content.len());
-
-    let settings: serde_json::Value =
-        serde_json::from_str(&content).map_err(|e| format!("Failed to parse settings: {}", e))?;
+    let settings = super::settings_store::read(&settings_path)?;
 
     let hooks = settings
         .get("hooks")
         .cloned()
         .unwrap_or(serde_json::json!({}));
-    log::info!(
-        "Returning hooks config: {}",
-        serde_json::to_string_pretty(&hooks).unwrap_or_default()
-    );
+    log::info!("Returning Claude hooks configuration without logging command values");
 
     Ok(hooks)
 }
@@ -68,6 +59,7 @@ pub async fn update_hooks_config(
     scope: String,
     hooks: serde_json::Value,
     project_path: Option<String>,
+    expected_hooks: Option<serde_json::Value>,
 ) -> Result<String, String> {
     log::info!(
         "Updating hooks config for scope: {}, project: {:?}",
@@ -96,24 +88,11 @@ pub async fn update_hooks_config(
         _ => return Err("Invalid scope".to_string()),
     };
 
-    // Read existing settings or create new
-    let mut settings = if settings_path.exists() {
-        let content = fs::read_to_string(&settings_path)
-            .map_err(|e| format!("Failed to read settings: {}", e))?;
-        serde_json::from_str(&content).map_err(|e| format!("Failed to parse settings: {}", e))?
-    } else {
-        serde_json::json!({})
-    };
-
-    // Update hooks section
-    settings["hooks"] = hooks;
-
-    // Write back with pretty formatting
-    let json_string = serde_json::to_string_pretty(&settings)
-        .map_err(|e| format!("Failed to serialize settings: {}", e))?;
-
-    fs::write(&settings_path, json_string)
-        .map_err(|e| format!("Failed to write settings: {}", e))?;
+    let current = super::settings_store::read(&settings_path)?;
+    let previous_hooks = expected_hooks.unwrap_or_else(|| current.get("hooks").cloned()
+        .unwrap_or_else(|| serde_json::json!({})));
+    super::settings_store::update(&settings_path, &serde_json::json!({"hooks":hooks}),
+        Some(&serde_json::json!({"hooks":previous_hooks})))?;
 
     Ok("Hooks configuration updated successfully".to_string())
 }

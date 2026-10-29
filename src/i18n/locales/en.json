@@ -1,4 +1,14 @@
 {
+  "nativeCompact": {
+    "effortRequestHint": "This is the requested effort. Your Claude version, model and configured limits determine the level actually used.",
+    "title": "Session auto-compaction",
+    "inherit": "Use Claude settings",
+    "pending": "Saved; applies when the next worker starts",
+    "checkpoint": "Claude checks before model requests; the work session stays the same",
+    "observed": "Compactions observed in this app run",
+    "effort": "Session effort",
+    "aboveEstimate": "Above the estimated threshold; Claude decides at its request checkpoint"
+  },
   "app": {
     "title": "Claude Workbench",
     "subtitle": "Professional desktop application and toolkit for Claude CLI"
@@ -694,6 +704,7 @@
     "collapseContent": "Collapse Content"
   },
   "session": {
+    "unverifiedReadOnly": "The original working directory is unverified. History is read-only; refresh and select the original project before resuming.",
     "userCancelled": "User cancelled session",
     "loadingHistory": "Loading session history...",
     "initializingClaude": "Initializing Claude Code...",
@@ -1004,6 +1015,7 @@
     "loading": "Loading GEMINI.md..."
   },
   "promptInput": {
+    "recoverLegacyDraft": "Recover the unassigned legacy draft into this session",
     "placeholder": "Ask Claude...",
     "placeholderDragActive": "Drop images here...",
     "expandInput": "Expand input",
@@ -1017,14 +1029,15 @@
     "doubleClickSkipTyping": "Double-click to skip typing effect",
     "thinkingModeOff": "Thinking Mode: Off",
     "thinkingModeOn": "Thinking: Mode On",
-    "normalSpeed": "Normal response speed",
+    "normalSpeed": "Keep Claude's existing defaults",
     "deepThinking": "Enable deep thinking (32K tokens)",
     "thinkingOn": "Thinking: On",
-    "thinkingOff": "Off",
+    "thinkingOff": "Claude default",
     "thinkingEnabled": "Adaptive thinking enabled",
-    "thinkingDisabled": "Adaptive thinking disabled",
-    "adaptiveThinking": "Adaptive Thinking ({{effort}})",
-    "effortDescription": "Click to cycle thinking effort level",
+    "thinkingDisabled": "This session follows Claude's effort settings",
+    "adaptiveThinking": "Session effort: {{effort}}",
+    "effortDescription": "Click to cycle; applies only to this session from its next turn",
+    "effortMaxDescription": "Max is Claude Code's highest real level. There is no separate Ultra level; availability depends on the model.",
     "thinkingEffortLow": "Thinking: Low",
     "thinkingEffortLowDesc": "Fast response, minimal thinking",
     "thinkingEffortMedium": "Thinking: Medium",

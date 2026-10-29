@@ -113,29 +113,26 @@ export const SessionList: React.FC<SessionListProps> = ({
 
   // Load CLAUDE.md files on mount
   useEffect(() => {
-    if (onEditClaudeFile && projectPath) {
-      loadClaudeMdFiles();
-    }
+    let current = true;
+    setClaudeMdFiles([]);
+    if (!onEditClaudeFile || !projectPath) return;
+    setLoadingClaudeMd(true);
+    api.findClaudeMdFiles(projectPath).then(files => {
+      if (current) setClaudeMdFiles(files);
+    }).catch(err => {
+      console.error('Failed to load CLAUDE.md files:', err);
+    }).finally(() => {
+      if (current) setLoadingClaudeMd(false);
+    });
+    return () => { current = false; };
   }, [projectPath, onEditClaudeFile]);
 
   // Reset selection when filter changes
   useEffect(() => {
     setSelectedSessions(new Set());
     setIsSelectionMode(false);
-  }, [sessionFilter]);
-
-  const loadClaudeMdFiles = async () => {
-    try {
-      setLoadingClaudeMd(true);
-      const files = await api.findClaudeMdFiles(projectPath);
-      setClaudeMdFiles(files);
-    } catch (err) {
-      console.error('Failed to load CLAUDE.md files:', err);
-      setClaudeMdFiles([]);
-    } finally {
-      setLoadingClaudeMd(false);
-    }
-  };
+    setCurrentPage(1);
+  }, [sessionFilter, projectPath]);
 
   const handleEditClaudeMd = () => {
     if (!onEditClaudeFile) return;
@@ -298,7 +295,7 @@ export const SessionList: React.FC<SessionListProps> = ({
 
   // Confirm conversion
   const confirmConvert = async () => {
-    if (!sessionToConvert || !onSessionConvert) return;
+    if (!sessionToConvert || !onSessionConvert || !projectPath) return;
 
     try {
       setIsConverting(true);
@@ -335,7 +332,7 @@ export const SessionList: React.FC<SessionListProps> = ({
             <span>{t('sessionList.backToProjects')}</span>
           </Button>
           <div className="flex-1 min-w-0">
-            <h2 className="text-base font-medium truncate">{projectPath}</h2>
+            <h2 className="text-base font-medium truncate">{projectPath || t('projectList.unconfirmedOwnership', { defaultValue: '项目归属未确认（只读）' })}</h2>
             <p className="text-xs text-muted-foreground">
               {filteredSessions.length} {sessionFilter === 'all' ? 'session' : sessionFilter} session{filteredSessions.length !== 1 ? 's' : ''}
               {sessionFilter === 'all' && sessions.length !== validSessions.length && (
@@ -471,7 +468,7 @@ export const SessionList: React.FC<SessionListProps> = ({
           )}
 
           {/* 新建会话按钮 */}
-          {onNewSession && (
+          {onNewSession && projectPath && (
             <Button
               onClick={() => onNewSession(projectPath)}
               size="sm"
@@ -578,7 +575,7 @@ export const SessionList: React.FC<SessionListProps> = ({
             </button>
 
             {/* Convert button - shown on hover (hidden in selection mode) */}
-            {!isSelectionMode && onSessionConvert && (
+            {!isSelectionMode && onSessionConvert && projectPath && (
               <button
                 onClick={(e) => handleConvertClick(e, session)}
                 className="px-3 py-2.5 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity hover:bg-primary/10 text-primary"

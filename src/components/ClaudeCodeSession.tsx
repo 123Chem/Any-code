@@ -42,6 +42,7 @@ import * as SessionHelpers from '@/lib/sessionHelpers';
 
 import type { ClaudeStreamMessage } from '@/types/claude';
 import type { CodexRateLimits } from '@/types/codex';
+import type { ClaudeThinkingEffort } from '@/types/nativeCompactPolicy';
 
 interface ClaudeCodeSessionProps {
   /**
@@ -52,6 +53,8 @@ interface ClaudeCodeSessionProps {
    * Initial project path (for new sessions)
    */
   initialProjectPath?: string;
+  /** Stable tab identity for drafts awaiting their original native UUID. */
+  draftScope?: string;
   /**
    * Optional className for styling
    */
@@ -88,6 +91,7 @@ interface ClaudeCodeSessionProps {
 const ClaudeCodeSessionInner: React.FC<ClaudeCodeSessionProps> = ({
   session,
   initialProjectPath = "",
+  draftScope,
   className,
   onStreamingChange,
   onProjectPathChange,
@@ -463,7 +467,7 @@ const ClaudeCodeSessionInner: React.FC<ClaudeCodeSessionProps> = ({
   // 🆕 包装 handleSendPrompt，发送消息时自动滚动到底部
   // 解决问题：当用户滚动查看历史消息后发送新消息，页面不会自动滚动到底部
   // 🔧 修复：消息数量过多时使用虚拟列表的 scrollToIndex 确保滚动到真正的底部
-  const handleSendPromptWithScroll = useCallback((prompt: string, model: ModelType, maxThinkingTokens?: number) => {
+  const handleSendPromptWithScroll = useCallback((prompt: string, model: ModelType, maxThinkingTokens?: number, claudeEffort?: ClaudeThinkingEffort | null) => {
     // 重置滚动状态，确保发送消息后自动滚动到底部
     setUserScrolled(false);
     setShouldAutoScroll(true);
@@ -474,7 +478,7 @@ const ClaudeCodeSessionInner: React.FC<ClaudeCodeSessionProps> = ({
       sessionMessagesRef.current?.scrollToBottom();
     }, 50);
 
-    handleSendPrompt(prompt, model, maxThinkingTokens);
+    handleSendPrompt(prompt, model, maxThinkingTokens, claudeEffort);
   }, [handleSendPrompt, setUserScrolled, setShouldAutoScroll]);
 
   // 🆕 方案 B-1: 设置发送提示词回调，用于计划批准后自动执行
@@ -1233,6 +1237,12 @@ const ClaudeCodeSessionInner: React.FC<ClaudeCodeSessionProps> = ({
 
         {/* Floating Prompt Input - 输入区域 */}
         <ErrorBoundary>
+          {executionEngineConfig.engine === 'claude' && effectiveSession &&
+            (!effectiveSession.project_path || effectiveSession.project_id.startsWith('claude-unverified-')) && (
+              <p role="status" className="px-4 py-2 text-sm text-muted-foreground">
+                {t('session.unverifiedReadOnly', '原会话工作目录尚未确认，只能查看历史；请刷新原项目后续聊。')}
+              </p>
+            )}
           {/* ✅ 重构：输入区域作为 Flex 容器的一部分，不再使用 fixed 定位 */}
           <FloatingPromptInput
             className="flex-shrink-0 transition-[left] duration-300"
@@ -1240,9 +1250,11 @@ const ClaudeCodeSessionInner: React.FC<ClaudeCodeSessionProps> = ({
             onSend={handleSendPromptWithScroll}
             onCancel={handleCancelExecution}
             isLoading={isLoading}
-            disabled={!projectPath}
+            disabled={!projectPath || (executionEngineConfig.engine === 'claude' && !!effectiveSession &&
+              (!effectiveSession.project_path || effectiveSession.project_id.startsWith('claude-unverified-')))}
             projectPath={projectPath}
             sessionId={effectiveSession?.id}         // 🆕 传递会话 ID
+            draftScope={draftScope}
             projectId={effectiveSession?.project_id} // 🆕 传递项目 ID
             sessionModel={session?.model}
             getConversationContext={getConversationContext}

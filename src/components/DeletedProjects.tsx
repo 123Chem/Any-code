@@ -62,47 +62,8 @@ export const DeletedProjects: React.FC<DeletedProjectsProps> = ({
     try {
       setLoading(true);
       
-      // Get list of hidden project IDs (now with intelligent directory validation)
-      const hiddenIds = await api.api.listHiddenProjects();
-      
-      if (hiddenIds.length === 0) {
-        setDeletedProjects([]);
-        setLoading(false);
-        return;
-      }
-      
-      // Create project objects with improved path decoding
-      const projects: Project[] = [];
-      
-      for (const projectId of hiddenIds) {
-        // Improved path decoding logic
-        let decodedPath = projectId;
-        
-        // Handle single-dash format (Claude CLI standard)
-        if (projectId.includes('-') && !projectId.includes('--')) {
-          decodedPath = projectId
-            .replace(/-/g, '/')
-            .replace(/^C\//, 'C:/')
-            .replace(/^\/+/, '/');
-        }
-        // Handle double-dash format (legacy claude-workbench)
-        else if (projectId.includes('--')) {
-          decodedPath = projectId
-            .replace(/--/g, '/')
-            .replace(/^C\//, 'C:/')
-            .replace(/^\/+/, '/');
-        }
-        
-        // Create project (format type will be determined in UI)
-        
-        projects.push({
-          id: projectId,
-          path: decodedPath,
-          sessions: [],
-          created_at: Date.now() / 1000
-        });
-      }
-      
+      // Hidden project labels use verified cwd, never a guessed decode of a lossy ID.
+      const projects = await api.api.listHiddenProjectDetails();
       setDeletedProjects(projects);
     } catch (error) {
       console.error("Failed to load deleted projects:", error);
@@ -236,7 +197,7 @@ export const DeletedProjects: React.FC<DeletedProjectsProps> = ({
                   </div>
                   <div className="min-w-0 flex-1">
                     <p className="font-semibold text-foreground/80 truncate">
-                      {project.path.split(/[\\\/]/).pop() || project.path}
+                      {project.path.split(/[\\\/]/).pop() || t('projectList.unconfirmedOwnership')}
                     </p>
                     <p className="text-xs text-muted-foreground font-mono truncate mt-0.5 bg-muted/30 inline-block px-1.5 py-0.5 rounded">
                       {project.path}

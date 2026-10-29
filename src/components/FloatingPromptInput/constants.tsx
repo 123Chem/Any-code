@@ -72,7 +72,7 @@ export const MODELS: ModelConfig[] = getModels();
 /**
  * Thinking modes configuration
  * Claude adaptive effort levels.
- * Controls effort via CLAUDE_CODE_EFFORT_LEVEL env var.
+ * Controls effort per session via the Claude Code --effort flag.
  *
  * Note: Names and descriptions are translation keys that will be resolved at runtime
  */

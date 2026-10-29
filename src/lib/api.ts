@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { ClaudeThinkingEffort, NativeSessionPolicy } from '@/types/nativeCompactPolicy';
 import type { HooksConfiguration } from '@/types/hooks';
 import { HooksManager } from '@/lib/hooksManager';
 import { codexProviderPresets } from '@/config/codexProviderPresets';
@@ -63,6 +64,19 @@ export const api = {
       console.error("Failed to list projects:", error);
       throw error;
     }
+  },
+
+  async resolveClaudeProjectIdentity(projectPath: string): Promise<string> {
+    return invoke('resolve_claude_project_identity', { projectPath });
+  },
+
+  async resolveClaudeSessionIdentity(sessionId: string, projectId: string): Promise<{
+    session_id: string;
+    project_id: string;
+    project_path: string;
+    project_verified: boolean;
+  }> {
+    return invoke('resolve_claude_session_identity', { sessionId, projectId });
   },
 
   /**
@@ -187,6 +201,10 @@ export const api = {
       console.error("Failed to list hidden projects:", error);
       throw error;
     }
+  },
+
+  async listHiddenProjectDetails(): Promise<Project[]> {
+    return invoke('list_hidden_project_details');
   },
 
   /**
@@ -330,13 +348,25 @@ export const api = {
    * @param settings - The settings object to save
    * @returns Promise resolving when the settings are saved
    */
-  async saveClaudeSettings(settings: ClaudeSettings): Promise<string> {
+  async saveClaudeSettings(settings: ClaudeSettings, expectedSettings?: ClaudeSettings): Promise<string> {
     try {
-      return await invoke<string>("save_claude_settings", { settings });
+      return await invoke<string>("save_claude_settings", { settings, expectedSettings });
     } catch (error) {
       console.error("Failed to save Claude settings:", error);
       throw error;
     }
+  },
+
+  async getClaudeSessionPolicy(sessionId: string, projectPath: string): Promise<NativeSessionPolicy> {
+    return invoke('get_claude_session_policy', { sessionId, projectPath });
+  },
+
+  async setClaudeSessionPolicy(sessionId: string, projectPath: string, percent: number | null): Promise<NativeSessionPolicy> {
+    return invoke('set_claude_session_policy', { sessionId, projectPath, percent });
+  },
+
+  async setClaudeSessionEffort(sessionId: string, projectPath: string, effort: ClaudeThinkingEffort | null): Promise<NativeSessionPolicy> {
+    return invoke('set_claude_session_effort', { sessionId, projectPath, effort });
   },
 
   /**
@@ -464,8 +494,8 @@ export const api = {
    * @param planMode - Enable Plan Mode for read-only research and planning
    * @param tabId - Unique identifier for the tab, used to filter global events
    */
-  async executeClaudeCode(projectPath: string, prompt: string, model: string, planMode?: boolean, maxThinkingTokens?: number, tabId?: string, fastMode?: boolean): Promise<void> {
-    return invoke("execute_claude_code", { projectPath, prompt, model, planMode, maxThinkingTokens, tabId, fastMode });
+  async executeClaudeCode(projectPath: string, prompt: string, model: string, planMode?: boolean, maxThinkingTokens?: number, tabId?: string, fastMode?: boolean, effort?: ClaudeThinkingEffort | null): Promise<void> {
+    return invoke("execute_claude_code", { projectPath, prompt, model, planMode, maxThinkingTokens, tabId, fastMode, effort: effort === undefined ? undefined : { level: effort } });
   },
 
   /**
@@ -473,8 +503,8 @@ export const api = {
    * @param planMode - Enable Plan Mode for read-only research and planning
    * @param tabId - Unique identifier for the tab, used to filter global events
    */
-  async continueClaudeCode(projectPath: string, prompt: string, model: string, planMode?: boolean, maxThinkingTokens?: number, tabId?: string, fastMode?: boolean): Promise<void> {
-    return invoke("continue_claude_code", { projectPath, prompt, model, planMode, maxThinkingTokens, tabId, fastMode });
+  async continueClaudeCode(projectPath: string, prompt: string, model: string, planMode?: boolean, maxThinkingTokens?: number, tabId?: string, fastMode?: boolean, sessionId?: string, effort?: ClaudeThinkingEffort | null): Promise<void> {
+    return invoke("continue_claude_code", { projectPath, prompt, model, planMode, maxThinkingTokens, tabId, fastMode, sessionId, effort: effort === undefined ? undefined : { level: effort } });
   },
 
   /**
@@ -482,8 +512,8 @@ export const api = {
    * @param planMode - Enable Plan Mode for read-only research and planning
    * @param tabId - Unique identifier for the tab, used to filter global events
    */
-  async resumeClaudeCode(projectPath: string, sessionId: string, prompt: string, model: string, planMode?: boolean, maxThinkingTokens?: number, tabId?: string, fastMode?: boolean): Promise<void> {
-    return invoke("resume_claude_code", { projectPath, sessionId, prompt, model, planMode, maxThinkingTokens, tabId, fastMode });
+  async resumeClaudeCode(projectPath: string, sessionId: string, prompt: string, model: string, planMode?: boolean, maxThinkingTokens?: number, tabId?: string, fastMode?: boolean, effort?: ClaudeThinkingEffort | null): Promise<void> {
+    return invoke("resume_claude_code", { projectPath, sessionId, prompt, model, planMode, maxThinkingTokens, tabId, fastMode, effort: effort === undefined ? undefined : { level: effort } });
   },
 
   /**
@@ -1264,10 +1294,11 @@ export const api = {
   async updateHooksConfig(
     scope: 'user' | 'project' | 'local',
     hooks: HooksConfiguration,
-    projectPath?: string
+    projectPath?: string,
+    expectedHooks?: HooksConfiguration
   ): Promise<string> {
     try {
-      return await invoke<string>("update_hooks_config", { scope, projectPath, hooks });
+      return await invoke<string>("update_hooks_config", { scope, projectPath, hooks, expectedHooks });
     } catch (error) {
       console.error("Failed to update hooks config:", error);
       throw error;

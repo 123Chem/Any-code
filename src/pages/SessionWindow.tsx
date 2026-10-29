@@ -10,7 +10,7 @@ import { parseSessionWindowParams, onWindowSyncEvent, emitWindowSyncEvent } from
 import { ClaudeCodeSession } from '@/components/ClaudeCodeSession';
 import { MessagesProvider } from '@/contexts/MessagesContext';
 import { PlanModeProvider } from '@/contexts/PlanModeContext';
-import type { Session } from '@/lib/api';
+import { api, type Session } from '@/lib/api';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Button } from '@/components/ui/button';
 import { Tooltip, TooltipContent, TooltipTrigger, TooltipProvider } from '@/components/ui/tooltip';
@@ -22,7 +22,7 @@ interface SessionWindowState {
   session: Session | null;
   projectPath: string | null;
   tabId: string | null;
-  engine: 'claude' | 'codex' | null;
+  engine: 'claude' | 'codex' | 'gemini' | null;
 }
 
 /**
@@ -46,6 +46,7 @@ export const SessionWindow: React.FC = () => {
 
   // Initialize session from URL parameters
   useEffect(() => {
+    let current = true;
     const initializeSession = async () => {
       if (!windowParams.isSessionWindow) {
         setState(prev => ({
@@ -67,12 +68,17 @@ export const SessionWindow: React.FC = () => {
         }));
 
         // Create session object if sessionId is provided
-        if (windowParams.sessionId && windowParams.projectPath) {
+        if (windowParams.sessionId) {
+          const legacyProjectId = windowParams.projectPath?.replace(/[^a-zA-Z0-9]/g, '-') || '';
+          const owner = (!engine || engine === 'claude')
+            ? await api.resolveClaudeSessionIdentity(windowParams.sessionId, windowParams.projectId || legacyProjectId)
+            : null;
+          if (!current) return;
           // Create session object - ClaudeCodeSession will handle loading the history
           const session: Session = {
             id: windowParams.sessionId,
-            project_id: windowParams.projectPath.replace(/[^a-zA-Z0-9]/g, '-'),
-            project_path: windowParams.projectPath,
+            project_id: owner?.project_id || windowParams.projectId || legacyProjectId,
+            project_path: owner ? owner.project_path : windowParams.projectPath || '',
             created_at: Date.now() / 1000,
             engine: engine || undefined,
           };
@@ -80,6 +86,7 @@ export const SessionWindow: React.FC = () => {
           setState(prev => ({
             ...prev,
             session,
+            projectPath: session.project_path || null,
             isLoading: false,
           }));
         } else {
@@ -90,16 +97,18 @@ export const SessionWindow: React.FC = () => {
           }));
         }
       } catch (error) {
+        if (!current) return;
         console.error('[SessionWindow] Initialization error:', error);
         setState(prev => ({
           ...prev,
           isLoading: false,
-          error: 'Failed to initialize session window',
+          error: String(error),
         }));
       }
     };
 
     initializeSession();
+    return () => { current = false; };
   }, [windowParams]);
 
   // Listen for window sync events
@@ -406,6 +415,7 @@ export const SessionWindow: React.FC = () => {
         <MessagesProvider>
           <PlanModeProvider>
             <ClaudeCodeSession
+              draftScope={state.tabId || undefined}
               key={state.tabId || 'detached-session'}
               initialProjectPath={state.projectPath || undefined}
               session={state.session || undefined}

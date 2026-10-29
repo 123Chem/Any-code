@@ -1,4 +1,5 @@
 import { getVersion } from "@tauri-apps/api/app";
+import { IS_LOCAL_REPAIR_BUILD } from "./repair-build";
 
 // 可选导入：在未注册插件或非 Tauri 环境下，调用时会抛错，外层需做兜底
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
@@ -90,6 +91,9 @@ export async function getCurrentVersion(): Promise<string> {
 export async function checkForUpdate(
   opts: CheckOptions = {},
 ): Promise<CheckResult> {
+  if (IS_LOCAL_REPAIR_BUILD) {
+    return { status: "up-to-date", currentVersion: await getCurrentVersion(), skipped: true };
+  }
   try {
     // 动态引入，避免在未安装插件时导致打包期问题
     const { check } = await import("@tauri-apps/plugin-updater");

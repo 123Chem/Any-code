@@ -1,6 +1,7 @@
 import React, { useState, useRef, forwardRef, useImperativeHandle, useEffect, useReducer, useCallback, useMemo } from "react";
 import { AnimatePresence } from "framer-motion";
 import { Sparkles } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { cn } from "@/lib/utils";
 import { FloatingPromptInputProps, FloatingPromptInputRef, ThinkingMode, ThinkingEffort, ModelType, ModelConfig } from "./types";
 import { getModels } from "./constants";
@@ -18,12 +19,15 @@ import { api } from "@/lib/api";
 import { getEnabledProviders } from "@/lib/promptEnhancementService";
 import { inputReducer, initialState } from "./reducer";
 import { getDefaultModel } from "./defaultModelStorage";
+import { useNativeSessionPolicy } from "@/hooks/useNativeSessionPolicy";
 
 // Import sub-components
 import { InputArea } from "./InputArea";
 import { AttachmentPreview } from "./AttachmentPreview";
 import { ControlBar } from "./ControlBar";
 import { ExpandedModal } from "./ExpandedModal";
+
+const EFFORT_CYCLE: (ThinkingEffort | 'off')[] = ['off', 'high', 'xhigh', 'max', 'low', 'medium'];
 
 // Re-export types for external use
 export type { FloatingPromptInputRef, FloatingPromptInputProps, ThinkingMode, ModelType } from "./types";
@@ -40,6 +44,7 @@ const FloatingPromptInputInner = (
     sessionModel,
     projectPath,
     sessionId,
+    draftScope,
     projectId,
     className,
     onCancel,
@@ -57,6 +62,7 @@ const FloatingPromptInputInner = (
   }: FloatingPromptInputProps,
   ref: React.Ref<FloatingPromptInputRef>,
 ) => {
+  const { t } = useTranslation();
   // Helper function to convert backend model string to frontend ModelType
   const parseSessionModel = (modelStr?: string): ModelType | null => {
     if (!modelStr) return null;
@@ -98,8 +104,9 @@ const FloatingPromptInputInner = (
   });
 
   // 草稿持久化 Hook - 确保输入内容在页面切换后不丢失
-  const { saveDraft, clearDraft } = useDraftPersistence({
+  const { saveDraft, clearDraft, hasLegacyDraft, restoreLegacyDraft } = useDraftPersistence({
     sessionId,
+    draftScope,
     onRestore: useCallback((draft: string) => {
       // 恢复草稿时更新 prompt 状态
       dispatch({ type: "SET_PROMPT", payload: draft });
@@ -118,48 +125,15 @@ const FloatingPromptInputInner = (
     }
   }, []);
 
-  // Initialize thinking mode from settings.json (source of truth)
-  // Read Claude Code effort settings from settings.json env
-  useEffect(() => {
-    const initThinkingMode = async () => {
-      try {
-        const settings = await api.getClaudeSettings();
-        const envVars = settings?.data?.env || settings?.env;
-        const effort = envVars?.CLAUDE_CODE_EFFORT_LEVEL || envVars?.CLAUDE_CODE_THINKING_EFFORT;
-        if (effort && ['low', 'medium', 'high', 'xhigh', 'max'].includes(effort)) {
-          dispatch({ type: "SET_THINKING_MODE", payload: { mode: 'adaptive', effort: effort as ThinkingEffort } });
-          localStorage.setItem('thinking_mode', 'adaptive');
-          localStorage.setItem('thinking_effort', effort);
-        } else {
-          // Check legacy MAX_THINKING_TOKENS for backward compatibility
-          const hasLegacy = envVars?.MAX_THINKING_TOKENS !== undefined;
-          if (hasLegacy) {
-            dispatch({ type: "SET_THINKING_MODE", payload: { mode: 'adaptive', effort: 'high' } });
-            localStorage.setItem('thinking_mode', 'adaptive');
-            localStorage.setItem('thinking_effort', 'high');
-          } else {
-            dispatch({ type: "SET_THINKING_MODE", payload: { mode: 'off' } });
-            localStorage.setItem('thinking_mode', 'off');
-          }
-        }
-      } catch (error) {
-        console.error('[ThinkingMode] Failed to read settings, falling back to localStorage:', error);
-        try {
-          const stored = localStorage.getItem('thinking_mode');
-          const storedEffort = localStorage.getItem('thinking_effort');
-          if (stored === 'adaptive' && storedEffort) {
-            dispatch({ type: "SET_THINKING_MODE", payload: { mode: 'adaptive', effort: storedEffort as ThinkingEffort } });
-          } else {
-            dispatch({ type: "SET_THINKING_MODE", payload: { mode: 'off' } });
-          }
-        } catch {
-          // Ignore error
-        }
-      }
-    };
-
-    initThinkingMode();
-  }, []);
+  // Unbound tabs keep their own draft choice; real UUIDs restore their policy.
+  const nativePolicy = useNativeSessionPolicy(sessionId, projectPath, state.executionEngineConfig.engine === 'claude');
+  const effortKey = `${sessionId || 'draft'}\0${projectPath || ''}`;
+  const [draftEffort, setDraftEffort] = useState<{ key: string; effort?: ThinkingEffort }>({ key: effortKey });
+  const selectedThinkingEffort = nativePolicy.valid
+    ? nativePolicy.policy?.configured_effort ?? undefined
+    : draftEffort.key === effortKey ? draftEffort.effort : undefined;
+  const selectedThinkingMode: ThinkingMode = selectedThinkingEffort ? 'adaptive' : 'off';
+  const thinkingDisabled = nativePolicy.saving || (nativePolicy.valid && !nativePolicy.policy);
 
   // Sync external config changes
   useEffect(() => {
@@ -426,47 +400,19 @@ const FloatingPromptInputInner = (
     setPrompt: (text: string) => dispatch({ type: "SET_PROMPT", payload: text }),
   }));
 
-  // Toggle thinking mode - cycle through: off → high → xhigh → max → low → medium → off
-  const EFFORT_CYCLE: (ThinkingEffort | 'off')[] = ['off', 'high', 'xhigh', 'max', 'low', 'medium'];
-
+  // Follow Claude defaults, or choose a real effort level for this session.
   const handleToggleThinkingMode = useCallback(async () => {
-    const currentMode = state.selectedThinkingMode;
-    const currentEffort = state.selectedThinkingEffort;
-
-    // Find current position in cycle
-    const currentKey = currentMode === 'off' ? 'off' : (currentEffort || 'high');
+    if (thinkingDisabled || state.executionEngineConfig.engine !== 'claude') return;
+    const currentKey = selectedThinkingEffort || 'off';
     const currentIndex = EFFORT_CYCLE.indexOf(currentKey);
     const nextIndex = (currentIndex + 1) % EFFORT_CYCLE.length;
     const nextKey = EFFORT_CYCLE[nextIndex];
 
-    const newMode: ThinkingMode = nextKey === 'off' ? 'off' : 'adaptive';
     const newEffort: ThinkingEffort | undefined = nextKey === 'off' ? undefined : nextKey as ThinkingEffort;
 
-    dispatch({ type: "SET_THINKING_MODE", payload: { mode: newMode, effort: newEffort } });
-
-    // Persist to localStorage
-    try {
-      localStorage.setItem('thinking_mode', newMode);
-      if (newEffort) localStorage.setItem('thinking_effort', newEffort);
-      else localStorage.removeItem('thinking_effort');
-    } catch {
-      // Ignore localStorage errors
-    }
-
-    try {
-      await api.updateThinkingMode(newMode === 'adaptive', newEffort);
-    } catch (error) {
-      console.error("Failed to update thinking mode:", error);
-      // Revert on error
-      dispatch({ type: "SET_THINKING_MODE", payload: { mode: currentMode, effort: currentEffort } });
-      try {
-        localStorage.setItem('thinking_mode', currentMode);
-        if (currentEffort) localStorage.setItem('thinking_effort', currentEffort);
-      } catch {
-        // Ignore localStorage errors
-      }
-    }
-  }, [state.selectedThinkingMode, state.selectedThinkingEffort]);
+    if (nativePolicy.valid) await nativePolicy.saveEffort(newEffort ?? null);
+    else setDraftEffort({ key: effortKey, effort: newEffort });
+  }, [effortKey, nativePolicy, selectedThinkingEffort, state.executionEngineConfig.engine, thinkingDisabled]);
 
   // Focus management
   useEffect(() => {
@@ -494,30 +440,10 @@ const FloatingPromptInputInner = (
     adjustTextareaHeight(textarea);
   }, [state.prompt, state.isExpanded]);
 
-  // Tab key listener - 🆕 只在没有建议时切换 thinking mode
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Tab' && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
-        const activeElement = document.activeElement;
-        const isInTextarea = activeElement?.tagName === 'TEXTAREA';
-        // 🆕 在 textarea 中且有建议时，不处理（由组件内部 handleKeyDown 处理）
-        if (isInTextarea && suggestion) {
-          return;
-        }
-        if (!isInTextarea && !disabled) {
-          e.preventDefault();
-          handleToggleThinkingMode();
-        }
-      }
-    };
-    document.addEventListener('keydown', handleKeyDown);
-    return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [disabled, handleToggleThinkingMode, suggestion]);
-
   // Event handlers
   const handleSend = () => {
     // Allow sending if there's text content OR image attachments
-    if ((state.prompt.trim() || imageAttachments.length > 0) && !disabled) {
+    if ((state.prompt.trim() || imageAttachments.length > 0) && !disabled && !nativePolicy.saving) {
       let finalPrompt = state.prompt.trim();
       if (imageAttachments.length > 0) {
         // Codex CLI doesn't recognize @ prefix syntax, use direct paths instead
@@ -545,7 +471,10 @@ const FloatingPromptInputInner = (
         }
       }
 
-      onSend(finalPrompt, modelToSend, undefined);
+      const effortRequest = nativePolicy.valid && !nativePolicy.policy
+        ? undefined : selectedThinkingEffort ?? null;
+      onSend(finalPrompt, modelToSend, undefined,
+        state.executionEngineConfig.engine === 'claude' ? effortRequest : undefined);
       dispatch({ type: "RESET_INPUT" });
       setImageAttachments([]);
       setEmbeddedImages([]);
@@ -592,6 +521,15 @@ const FloatingPromptInputInner = (
       return;
     }
 
+    // Only this textarea owns the shortcut; hidden tabs never react to it.
+    if (e.key === 'Tab' && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey
+        && !showFilePicker && !showSlashCommandMenu && !disabled
+        && state.executionEngineConfig.engine === 'claude') {
+      e.preventDefault();
+      void handleToggleThinkingMode();
+      return;
+    }
+
     // 🆕 Escape 键取消建议
     if (e.key === 'Escape' && suggestion && !showFilePicker) {
       e.preventDefault();
@@ -635,8 +573,9 @@ const FloatingPromptInputInner = (
             selectedModel={state.selectedModel}
             setSelectedModel={(model) => dispatch({ type: "SET_MODEL", payload: model })}
             availableModels={availableModels}
-            selectedThinkingMode={state.selectedThinkingMode}
-            selectedThinkingEffort={state.selectedThinkingEffort}
+            selectedThinkingMode={selectedThinkingMode}
+            selectedThinkingEffort={selectedThinkingEffort}
+            thinkingDisabled={thinkingDisabled}
             handleToggleThinkingMode={handleToggleThinkingMode}
             isPlanMode={isPlanMode}
             onTogglePlanMode={onTogglePlanMode}
@@ -676,6 +615,12 @@ const FloatingPromptInputInner = (
         />
 
         <div className="mx-auto max-w-4xl space-y-2 px-4 py-3">
+          {hasLegacyDraft && !disabled && !isLoading && !state.prompt.trim() && (
+            <button type="button" className="text-xs text-muted-foreground hover:text-foreground"
+              onClick={restoreLegacyDraft}>
+              {t('promptInput.recoverLegacyDraft', '恢复旧版未归属草稿到当前会话')}
+            </button>
+          )}
           <InputArea
             ref={textareaRef}
             prompt={state.prompt}
@@ -725,8 +670,9 @@ const FloatingPromptInputInner = (
             selectedModel={state.selectedModel}
             setSelectedModel={(model) => dispatch({ type: "SET_MODEL", payload: model })}
             availableModels={availableModels}
-            selectedThinkingMode={state.selectedThinkingMode}
-            selectedThinkingEffort={state.selectedThinkingEffort}
+            selectedThinkingMode={selectedThinkingMode}
+            selectedThinkingEffort={selectedThinkingEffort}
+            thinkingDisabled={thinkingDisabled}
             handleToggleThinkingMode={handleToggleThinkingMode}
             isPlanMode={isPlanMode}
             onTogglePlanMode={onTogglePlanMode}
@@ -749,6 +695,9 @@ const FloatingPromptInputInner = (
             onCancel={onCancel || (() => {})}
             onSend={handleSend}
           />
+          {state.executionEngineConfig.engine === 'claude' && nativePolicy.error && (
+            <div role="alert" className="text-xs text-destructive break-words">{nativePolicy.error}</div>
+          )}
         </div>
       </div>
     </>

@@ -21,7 +21,7 @@ export type ThinkingMode = "off" | "adaptive";
 /**
  * Thinking effort level
  */
-export type ThinkingEffort = "low" | "medium" | "high" | "xhigh" | "max";
+export type ThinkingEffort = import('@/types/nativeCompactPolicy').ClaudeThinkingEffort;
 
 /**
  * Model configuration
@@ -65,9 +65,9 @@ export type ExecutionEngineConfig = import('@/components/ExecutionEngineSelector
  */
 export interface FloatingPromptInputProps {
   /**
-   * Callback when prompt is sent - includes maxThinkingTokens separately
+   * Callback when prompt is sent; Claude effort belongs to this session only.
    */
-  onSend: (prompt: string, model: ModelType, maxThinkingTokens?: number) => void;
+  onSend: (prompt: string, model: ModelType, maxThinkingTokens?: number, claudeEffort?: ThinkingEffort | null) => void;
   /**
    * Whether the input is loading
    */
@@ -92,6 +92,8 @@ export interface FloatingPromptInputProps {
    * 🆕 Session ID (for history-aware context search)
    */
   sessionId?: string;
+  /** Stable tab identity used before a native session UUID exists. */
+  draftScope?: string;
   /**
    * 🆕 Project ID (for history-aware context search)
    */

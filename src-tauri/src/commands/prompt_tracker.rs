@@ -7,6 +7,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use super::claude::get_claude_dir;
+use super::claude::project_identity;
 use super::permission_config::ClaudeExecutionConfig;
 use super::simple_git;
 
@@ -90,12 +91,26 @@ pub fn load_execution_config() -> Result<ClaudeExecutionConfig> {
 /// Get path to git records file
 fn get_git_records_path(session_id: &str, project_id: &str) -> Result<PathBuf> {
     let claude_dir = get_claude_dir().context("Failed to get claude dir")?;
-    let records_path = claude_dir
-        .join("projects")
-        .join(project_id)
-        .join("sessions")
-        .join(format!("{}.git-records.json", session_id));
-    Ok(records_path)
+    let location = project_identity::resolve_optional_session(&claude_dir, project_id, session_id)
+        .map_err(anyhow::Error::msg)?;
+    let detached = project_identity::detached_git_records_path(&claude_dir, session_id)
+        .map_err(anyhow::Error::msg)?;
+    if detached.exists() {
+        return Ok(detached);
+    }
+    if let Some(location) = location {
+        let directory = location
+            .path
+            .parent()
+            .context("Claude session directory is unavailable")?;
+        let records = directory
+            .join("sessions")
+            .join(format!("{session_id}.git-records.json"));
+        if records.exists() {
+            return Ok(records);
+        }
+    }
+    Ok(detached)
 }
 /// Load git records from .git-records.json (using prompt_index as key)
 fn load_git_records(session_id: &str, project_id: &str) -> Result<HashMap<usize, GitRecord>> {
@@ -129,6 +144,9 @@ fn save_git_records(
     project_id: &str,
     records: &HashMap<usize, GitRecord>,
 ) -> Result<()> {
+    let root = get_claude_dir().context("Failed to get claude dir")?;
+    project_identity::resolve_optional_session_for_mutation(&root, project_id, session_id)
+        .map_err(anyhow::Error::msg)?;
     let records_path = get_git_records_path(session_id, project_id)?;
 
     // Ensure directory exists
@@ -217,12 +235,17 @@ fn truncate_session_to_prompt(
     prompt_index: usize,
 ) -> Result<()> {
     let claude_dir = get_claude_dir().context("Failed to get claude dir")?;
-    let project_dir = claude_dir.join("projects").join(project_id);
-    let session_path = project_dir.join(format!("{}.jsonl", session_id));
-
-    if !session_path.exists() {
-        return Ok(()); // No session file, nothing to truncate
-    }
+    let location =
+        project_identity::resolve_session_for_mutation(&claude_dir, project_id, session_id)
+            .map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        location.project_path.is_some(),
+        "Unconfirmed Claude project history is read-only"
+    );
+    let session_path = location.path;
+    let project_dir = session_path
+        .parent()
+        .context("Claude session directory is unavailable")?;
 
     // ========================================================================
     // Step 1: Process main session file
@@ -508,6 +531,8 @@ pub async fn record_prompt_sent(
     project_path: String,
     _prompt_text: String,
 ) -> Result<usize, String> {
+    let root = get_claude_dir().map_err(|error| error.to_string())?;
+    project_identity::validate_selected_project(&root, &project_id, &session_id, &project_path)?;
     log::info!(
         "[Record Prompt] Recording prompt sent for session: {}",
         session_id
@@ -583,6 +608,8 @@ pub async fn mark_prompt_completed(
     prompt_index: usize,
     prompt_text: Option<String>,
 ) -> Result<(), String> {
+    let root = get_claude_dir().map_err(|error| error.to_string())?;
+    project_identity::validate_selected_project(&root, &project_id, &session_id, &project_path)?;
     log::info!("Marking prompt #{} completed", prompt_index);
 
     // Check if Git operations are disabled in config
@@ -656,12 +683,15 @@ pub async fn revert_to_prompt(
     prompt_index: usize,
     mode: RewindMode,
 ) -> Result<String, String> {
+    let root = get_claude_dir().map_err(|error| error.to_string())?;
+    project_identity::validate_selected_project(&root, &project_id, &session_id, &project_path)?;
     log::info!(
         "Reverting to prompt #{} in session: {} with mode: {:?}",
         prompt_index,
         session_id,
         mode
     );
+    let _lease = super::claude::session_policy::mutation_lease(&root, &session_id)?;
 
     // Load execution config to check if Git operations are disabled
     let execution_config =
@@ -728,7 +758,10 @@ pub async fn revert_to_prompt(
         }
 
         RewindMode::CodeOnly => {
-            log::info!("Reverting code only (keeping messages) - revert to state before prompt #{}", prompt_index);
+            log::info!(
+                "Reverting code only (keeping messages) - revert to state before prompt #{}",
+                prompt_index
+            );
 
             // 1. Stash any uncommitted changes
             simple_git::git_stash_save(
@@ -775,7 +808,10 @@ pub async fn revert_to_prompt(
                 let commit_after = match &record.commit_after {
                     Some(c) if c != &record.commit_before => c.clone(),
                     _ => {
-                        log::debug!("[Precise Revert] Skipping prompt #{} - no code changes", idx);
+                        log::debug!(
+                            "[Precise Revert] Skipping prompt #{} - no code changes",
+                            idx
+                        );
                         continue;
                     }
                 };
@@ -870,7 +906,10 @@ pub async fn revert_to_prompt(
         }
 
         RewindMode::Both => {
-            log::info!("Reverting both conversation and code - revert to state before prompt #{}", prompt_index);
+            log::info!(
+                "Reverting both conversation and code - revert to state before prompt #{}",
+                prompt_index
+            );
 
             // 1. Stash any uncommitted changes
             simple_git::git_stash_save(
@@ -917,7 +956,10 @@ pub async fn revert_to_prompt(
                 let commit_after = match &record.commit_after {
                     Some(c) if c != &record.commit_before => c.clone(),
                     _ => {
-                        log::debug!("[Precise Revert] Skipping prompt #{} - no code changes", idx);
+                        log::debug!(
+                            "[Precise Revert] Skipping prompt #{} - no code changes",
+                            idx
+                        );
                         continue;
                     }
                 };
@@ -1019,7 +1061,8 @@ pub async fn revert_to_prompt(
                 );
 
                 // Attempt to rollback Git changes
-                if let Err(rollback_err) = simple_git::git_reset_hard(&project_path, &original_head) {
+                if let Err(rollback_err) = simple_git::git_reset_hard(&project_path, &original_head)
+                {
                     log::error!("[CRITICAL] Git rollback failed: {}", rollback_err);
                     return Err(format!(
                         "会话文件截断失败，且 Git 回滚也失败，仓库可能处于不一致状态。\n\
@@ -1041,14 +1084,18 @@ pub async fn revert_to_prompt(
             // 🔧 ATOMIC PROTECTION: If git records truncation fails, rollback Git changes
             // Note: Session file is already truncated at this point, cannot easily rollback
             if !git_operations_disabled {
-                if let Err(e) = truncate_git_records(&session_id, &project_id, &prompts, prompt_index) {
+                if let Err(e) =
+                    truncate_git_records(&session_id, &project_id, &prompts, prompt_index)
+                {
                     log::error!(
                         "[Atomic Rollback] Git records truncation failed, rolling back Git: {}",
                         e
                     );
 
                     // Attempt to rollback Git changes
-                    if let Err(rollback_err) = simple_git::git_reset_hard(&project_path, &original_head) {
+                    if let Err(rollback_err) =
+                        simple_git::git_reset_hard(&project_path, &original_head)
+                    {
                         log::error!("[CRITICAL] Git rollback failed: {}", rollback_err);
                         return Err(format!(
                             "Git 记录截断失败，且 Git 回滚也失败。\n\
@@ -1206,14 +1253,13 @@ pub async fn check_rewind_capabilities(
 /// This is the single source of truth for all prompts (both CLI and project interface)
 fn extract_prompts_from_jsonl(session_id: &str, project_id: &str) -> Result<Vec<PromptRecord>> {
     let claude_dir = get_claude_dir().context("Failed to get claude dir")?;
-    let session_path = claude_dir
-        .join("projects")
-        .join(project_id)
-        .join(format!("{}.jsonl", session_id));
-
-    if !session_path.exists() {
+    let Some(location) =
+        project_identity::resolve_optional_session(&claude_dir, project_id, session_id)
+            .map_err(anyhow::Error::msg)?
+    else {
         return Ok(Vec::new());
-    }
+    };
+    let session_path = location.path;
 
     let content = fs::read_to_string(&session_path).context("Failed to read session file")?;
 

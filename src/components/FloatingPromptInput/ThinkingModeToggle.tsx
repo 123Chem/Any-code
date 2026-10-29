@@ -30,8 +30,7 @@ const EFFORT_LABELS: Record<ThinkingEffort, string> = {
 };
 
 /**
- * ThinkingModeToggle - Adaptive Thinking with effort levels
- * Click to cycle: off → high → xhigh → max → low → medium → off
+ * Real per-session effort, with Claude's own defaults as the inherit option.
  */
 export const ThinkingModeToggle: React.FC<ThinkingModeToggleProps> = ({
   isEnabled,
@@ -80,6 +79,11 @@ export const ThinkingModeToggle: React.FC<ThinkingModeToggleProps> = ({
                 ? t('promptInput.effortDescription')
                 : t('promptInput.normalSpeed')}
             </p>
+            {effort === 'max' && (
+              <p className="text-xs text-muted-foreground max-w-64 mt-1">
+                {t('promptInput.effortMaxDescription')}
+              </p>
+            )}
             <p className="text-xs text-muted-foreground mt-1">
               {t('common.back')}: <kbd className="px-1 py-0.5 bg-muted rounded">Tab</kbd>
             </p>

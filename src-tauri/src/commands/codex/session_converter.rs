@@ -302,9 +302,9 @@ pub fn map_claude_to_codex_tool(claude_name: &str) -> String {
 /// Claude Session → Codex Session 转换器
 pub struct ClaudeToCodexConverter {
     source_session_id: String,
-    project_id: String,           // 实际的目录名（如 C--Users-...）
-    project_path: String,         // 原始项目路径
-    new_session_uuid: String,     // 纯 UUID（用于文件内容）
+    project_id: String, // Logical project identity or a compatible legacy storage ID
+    project_path: String, // 原始项目路径
+    new_session_uuid: String, // 纯 UUID（用于文件内容）
     new_session_filename: String, // rollout-{uuid}（用于文件名）
 }
 
@@ -456,18 +456,18 @@ impl ClaudeToCodexConverter {
         let claude_dir = super::super::claude::get_claude_dir()
             .map_err(|e| format!("Failed to get Claude directory: {}", e))?;
 
-        // 直接使用 project_id（实际的目录名）
-        let session_path = claude_dir
-            .join("projects")
-            .join(&self.project_id)
-            .join(format!("{}.jsonl", self.source_session_id));
-
-        if !session_path.exists() {
-            return Err(format!(
-                "Claude session file not found: {}",
-                session_path.display()
-            ));
-        }
+        let location = super::super::claude::project_identity::resolve_session(
+            &claude_dir,
+            &self.project_id,
+            &self.source_session_id,
+        )?;
+        super::super::claude::project_identity::validate_selected_project(
+            &claude_dir,
+            &self.project_id,
+            &self.source_session_id,
+            &self.project_path,
+        )?;
+        let session_path = location.path;
 
         let file = std::fs::File::open(&session_path)
             .map_err(|e| format!("Failed to open session file: {}", e))?;
@@ -725,8 +725,8 @@ impl ClaudeToCodexConverter {
 /// Codex Session → Claude Session 转换器
 pub struct CodexToClaudeConverter {
     source_session_id: String,
-    project_id: String,     // 实际的目录名（如 C--Users-...）
-    project_path: String,   // 原始项目路径
+    project_id: String, // Logical project identity or a compatible legacy storage ID
+    project_path: String, // 原始项目路径
     new_session_id: String, // UUID 格式
 }
 
@@ -1179,8 +1179,18 @@ impl CodexToClaudeConverter {
         let claude_dir = super::super::claude::get_claude_dir()
             .map_err(|e| format!("Failed to get Claude directory: {}", e))?;
 
-        // 直接使用 project_id（实际的目录名）
-        let project_dir = claude_dir.join("projects").join(&self.project_id);
+        if super::super::claude::project_identity::is_logical_project_id(&self.project_id)
+            && super::super::claude::project_identity::project_id_for_path(&self.project_path)?
+                != self.project_id
+        {
+            return Err(
+                "The selected conversion project does not match its working directory".into(),
+            );
+        }
+        let project_dir = super::super::claude::project_identity::native_directory_for_new_session(
+            &claude_dir,
+            &self.project_path,
+        )?;
 
         std::fs::create_dir_all(&project_dir)
             .map_err(|e| format!("Failed to create project directory: {}", e))?;
@@ -1227,11 +1237,13 @@ fn detect_session_engine(session_id: &str, project_id: &str) -> Result<String, S
 
     // 2. 检查是否为 Claude session（查找 projects 目录）
     if let Ok(claude_dir) = super::super::claude::get_claude_dir() {
-        let session_path = claude_dir
-            .join("projects")
-            .join(project_id)
-            .join(format!("{}.jsonl", session_id));
-        if session_path.exists() {
+        if super::super::claude::project_identity::resolve_session(
+            &claude_dir,
+            project_id,
+            session_id,
+        )
+        .is_ok()
+        {
             return Ok("claude".to_string());
         }
     }

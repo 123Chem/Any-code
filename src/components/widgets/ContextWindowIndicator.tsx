@@ -15,11 +15,15 @@ import { useContextWindowUsage } from '@/hooks/useContextWindowUsage';
 import { USAGE_LEVEL_COLORS } from '@/types/contextWindow';
 import { cn } from '@/lib/utils';
 import type { ClaudeStreamMessage } from '@/types/claude';
+import { useNativeSessionPolicy } from '@/hooks/useNativeSessionPolicy';
+import { nativeThresholdEstimate } from '@/types/nativeCompactPolicy';
+import { NativeCompactControls } from './NativeCompactControls';
 
 // Claude 的 Auto-compact buffer 预留量 (45k tokens)
-const AUTO_COMPACT_BUFFER = 45000;
 
 export interface ContextWindowIndicatorProps {
+  sessionId?: string;
+  projectPath?: string;
   /** 会话消息列表 */
   messages: ClaudeStreamMessage[];
   /** 当前使用的模型 */
@@ -49,6 +53,8 @@ const formatK = (tokens: number): string => {
  * 支持多引擎（Claude/Codex）
  */
 export const ContextWindowIndicator: React.FC<ContextWindowIndicatorProps> = ({
+  sessionId,
+  projectPath,
   messages,
   model,
   engine,
@@ -59,6 +65,7 @@ export const ContextWindowIndicator: React.FC<ContextWindowIndicatorProps> = ({
   const [showPopover, setShowPopover] = React.useState(false);
 
   const usage = useContextWindowUsage(messages, model, engine);
+  const nativePolicy = useNativeSessionPolicy(sessionId, projectPath, engine === 'claude');
   const colors = USAGE_LEVEL_COLORS[usage.level];
 
   // 如果没有数据或不显示，返回 null
@@ -68,11 +75,14 @@ export const ContextWindowIndicator: React.FC<ContextWindowIndicatorProps> = ({
 
   // 计算 Auto-compact 相关数据（仅 Claude 引擎）
   const isClaudeEngine = engine === 'claude';
-  const autoCompactThreshold = usage.contextWindowSize - AUTO_COMPACT_BUFFER;
+  const appliedPercent = nativePolicy.policy?.observation.active
+    ? nativePolicy.policy.observation.applied_percent : nativePolicy.policy?.configured_percent ?? null;
+  const estimatedThreshold = nativeThresholdEstimate(usage.contextWindowSize, appliedPercent);
+  const autoCompactThreshold = estimatedThreshold ?? usage.contextWindowSize;
   const autoCompactThresholdPercentage = (autoCompactThreshold / usage.contextWindowSize) * 100;
   const tokensUntilCompact = Math.max(0, autoCompactThreshold - usage.currentTokens);
-  const isNearCompact = isClaudeEngine && usage.currentTokens >= autoCompactThreshold * 0.9; // 90% of threshold
-  const willTriggerCompact = isClaudeEngine && usage.currentTokens >= autoCompactThreshold;
+  const isNearCompact = isClaudeEngine && estimatedThreshold !== null && usage.currentTokens >= autoCompactThreshold * 0.9;
+  const willTriggerCompact = isClaudeEngine && estimatedThreshold !== null && usage.currentTokens >= autoCompactThreshold;
 
   return (
     <motion.div
@@ -103,7 +113,7 @@ export const ContextWindowIndicator: React.FC<ContextWindowIndicatorProps> = ({
                 style={{ width: `${Math.min(usage.percentage, 100)}%` }}
               />
               {/* Auto-compact 阈值线（仅 Claude） */}
-              {isClaudeEngine && (
+              {isClaudeEngine && estimatedThreshold !== null && (
                 <div
                   className="absolute top-0 bottom-0 w-px bg-amber-500 dark:bg-amber-400"
                   style={{ left: `${autoCompactThresholdPercentage}%` }}
@@ -146,7 +156,7 @@ export const ContextWindowIndicator: React.FC<ContextWindowIndicatorProps> = ({
                   style={{ width: `${Math.min(usage.percentage, 100)}%` }}
                 />
                 {/* Auto-compact 阈值线（仅 Claude） */}
-                {isClaudeEngine && (
+                {isClaudeEngine && estimatedThreshold !== null && (
                   <div
                     className="absolute top-0 bottom-0 w-0.5 bg-amber-500 dark:bg-amber-400 z-10"
                     style={{ left: `${autoCompactThresholdPercentage}%` }}
@@ -182,17 +192,17 @@ export const ContextWindowIndicator: React.FC<ContextWindowIndicatorProps> = ({
                       ? "text-amber-700 dark:text-amber-300"
                       : "text-foreground"
                   )}>
-                    Auto-compact Buffer
+                    {t('nativeCompact.title', '本会话自动压缩')}
                   </span>
                 </div>
                 <div className="space-y-1 pl-5">
                   <div className="flex justify-between">
                     <span className="text-muted-foreground">预留空间:</span>
-                    <span className="font-mono">{formatK(AUTO_COMPACT_BUFFER)}</span>
+                    <span className="font-mono">{estimatedThreshold === null ? '—' : formatK(usage.contextWindowSize - autoCompactThreshold)}</span>
                   </div>
                   <div className="flex justify-between">
-                    <span className="text-muted-foreground">压缩阈值:</span>
-                    <span className="font-mono">{formatK(autoCompactThreshold)}</span>
+                    <span className="text-muted-foreground">估计压缩阈值:</span>
+                    <span className="font-mono">{estimatedThreshold === null ? t('nativeCompact.inherit', '跟随Claude设置') : formatK(autoCompactThreshold)}</span>
                   </div>
                   <div className="flex justify-between">
                     <span className="text-muted-foreground">距离压缩:</span>
@@ -204,17 +214,19 @@ export const ContextWindowIndicator: React.FC<ContextWindowIndicatorProps> = ({
                           ? "text-yellow-600 dark:text-yellow-400"
                           : ""
                     )}>
-                      {willTriggerCompact ? '即将触发' : formatK(tokensUntilCompact)}
+                      {estimatedThreshold === null ? '—' : willTriggerCompact ? '已超过估计值' : formatK(tokensUntilCompact)}
                     </span>
                   </div>
                 </div>
                 {willTriggerCompact && (
                   <div className="mt-2 pt-2 border-t border-amber-200 dark:border-amber-700 text-amber-700 dark:text-amber-300">
-                    上下文已达压缩阈值，将自动优化
+                    {t('nativeCompact.aboveEstimate', '已超过估计阈值，实际压缩由Claude请求检查点决定')}
                   </div>
                 )}
               </div>
             )}
+
+            {isClaudeEngine && <NativeCompactControls state={nativePolicy} />}
 
             {/* Token 详情 */}
             <div className="space-y-1 text-xs border-t pt-2">

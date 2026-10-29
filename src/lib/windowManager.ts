@@ -15,6 +15,7 @@ import { emit, listen, type UnlistenFn } from '@tauri-apps/api/event';
 export interface CreateSessionWindowParams {
   tabId: string;
   sessionId?: string;
+  projectId?: string;
   projectPath?: string;
   title: string;
   /** Execution engine: 'claude' | 'codex' | 'gemini' */
@@ -51,6 +52,7 @@ export async function createSessionWindow(params: CreateSessionWindowParams): Pr
       params: {
         tab_id: params.tabId,
         session_id: params.sessionId || null,
+        project_id: params.projectId || null,
         project_path: params.projectPath || null,
         title: params.title,
         engine: params.engine || null,
@@ -205,8 +207,9 @@ export function parseSessionWindowParams(): {
   isSessionWindow: boolean;
   tabId?: string;
   sessionId?: string;
+  projectId?: string;
   projectPath?: string;
-  engine?: 'claude' | 'codex';
+  engine?: 'claude' | 'codex' | 'gemini';
 } {
   const params = new URLSearchParams(window.location.search);
   const windowType = params.get('window');
@@ -217,15 +220,16 @@ export function parseSessionWindowParams(): {
 
   const tabId = params.get('tab_id') || undefined;
   const sessionId = params.get('session_id') || undefined;
-  const projectPath = params.get('project_path')
-    ? decodeURIComponent(params.get('project_path')!)
-    : undefined;
+  const projectId = params.get('project_id') || undefined;
+  // URLSearchParams already decodes once; a literal % in a directory must remain intact.
+  const projectPath = params.get('project_path') || undefined;
   const engineParam = params.get('engine');
-  const engine = (engineParam === 'claude' || engineParam === 'codex') ? engineParam : undefined;
+  const engine = (engineParam === 'claude' || engineParam === 'codex' || engineParam === 'gemini') ? engineParam : undefined;
   return {
     isSessionWindow: true,
     tabId,
     sessionId,
+    projectId,
     projectPath,
     engine,
   };
