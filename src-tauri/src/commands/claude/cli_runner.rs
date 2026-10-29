@@ -16,6 +16,16 @@ use super::config::get_claude_execution_config;
 use super::paths::{encode_project_path, get_claude_dir};
 use super::platform;
 
+fn global_event_payload<T: serde::Serialize>(
+    tab_id: &Option<String>, session_id: &str, payload: T,
+) -> serde_json::Value {
+    serde_json::json!({ "tab_id": tab_id, "session_id": session_id, "payload": payload })
+}
+
+#[cfg(test)]
+#[path = "cli_runner_event_tests.rs"]
+mod event_tests;
+
 /// Global state to track current Claude process
 pub struct ClaudeProcessState {
     pub current_process: Arc<Mutex<Option<Child>>>,
@@ -629,17 +639,14 @@ pub async fn cancel_claude_execution(
         log::warn!("No active Claude process found to cancel");
     }
 
-    // Always emit cancellation events for UI consistency
+    // Only a known original UUID can publish a cancellation to other listeners.
     if let Some(sid) = session_id {
         let _ = app.emit(&format!("claude-cancelled:{}", sid), true);
+        let _ = app.emit("claude-cancelled", global_event_payload(&None, &sid, true));
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         let _ = app.emit(&format!("claude-complete:{}", sid), false);
+        let _ = app.emit("claude-complete", global_event_payload(&None, &sid, false));
     }
-
-    // Also emit generic events for backward compatibility
-    let _ = app.emit("claude-cancelled", true);
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    let _ = app.emit("claude-complete", false);
 
     if killed {
         log::info!("Claude process cancellation completed successfully");
@@ -1037,7 +1044,8 @@ async fn spawn_claude_process(
                         }
                     }
                     Err(error) => {
-                        let payload = serde_json::json!({"tab_id":tab_id_for_stdout,"payload":error});
+                        let _ = app_handle.emit(&format!("claude-error:{}", prepared_stdout.session_id), &error);
+                        let payload = global_event_payload(&tab_id_for_stdout, &prepared_stdout.session_id, &error);
                         let _ = app_handle.emit("claude-error", payload);
                         if pid != 0 { let _ = platform::kill_process_tree(pid); }
                         break;
@@ -1176,36 +1184,23 @@ async fn spawn_claude_process(
                 let _ = registry_clone.append_live_output(run_id, &line);
             }
 
-            // Emit the line to the frontend with session isolation if we have session ID
-            if let Some(ref session_id) = *session_id_holder_clone.lock().unwrap() {
-                let _ = app_handle.emit(&format!("claude-output:{}", session_id), &line);
-            }
-            // 🔒 CRITICAL FIX: 全局事件包含 tab_id，用于前端过滤新建会话的消息
-            let global_payload = serde_json::json!({
-                "tab_id": tab_id_for_stdout,
-                "payload": &line
-            });
+            // The prepared UUID is available even before the CLI's first init.
+            let _ = app_handle.emit(&format!("claude-output:{}", prepared_stdout.session_id), &line);
+            let global_payload = global_event_payload(&tab_id_for_stdout, &prepared_stdout.session_id, &line);
             let _ = app_handle.emit("claude-output", &global_payload);
         }
     });
 
     let app_handle_stderr = app.clone();
-    let session_id_holder_clone2 = session_id_holder.clone();
+    let session_id_for_stderr = prepared.session_id.clone();
     // 🔒 CRITICAL FIX: 克隆 tab_id 用于 stderr 事件
     let tab_id_for_stderr = tab_id.clone();
     let stderr_task = tokio::spawn(async move {
         let mut lines = stderr_reader.lines();
         while let Ok(Some(line)) = lines.next_line().await {
             log::error!("Claude stderr: {}", line);
-            // Emit error lines to the frontend with session isolation if we have session ID
-            if let Some(ref session_id) = *session_id_holder_clone2.lock().unwrap() {
-                let _ = app_handle_stderr.emit(&format!("claude-error:{}", session_id), &line);
-            }
-            // 🔒 CRITICAL FIX: 全局事件包含 tab_id
-            let global_payload = serde_json::json!({
-                "tab_id": tab_id_for_stderr,
-                "payload": &line
-            });
+            let _ = app_handle_stderr.emit(&format!("claude-error:{}", session_id_for_stderr), &line);
+            let global_payload = global_event_payload(&tab_id_for_stderr, &session_id_for_stderr, &line);
             let _ = app_handle_stderr.emit("claude-error", &global_payload);
         }
     });
@@ -1214,7 +1209,6 @@ async fn spawn_claude_process(
     // 🔒 CRITICAL FIX: 直接将 child 移动到 wait task 中，而不是从全局 state 取出
     // 这样每个进程独立管理自己的生命周期，支持真正的多会话并发
     let app_handle_wait = app.clone();
-    let session_id_holder_clone3 = session_id_holder.clone();
     let run_id_holder_clone2 = run_id_holder.clone();
     let registry_clone2 = registry.0.clone();
     let last_spawned_pid = claude_state.last_spawned_pid.clone();
@@ -1230,7 +1224,7 @@ async fn spawn_claude_process(
         let exit_status = child.wait().await;
         let policy_session = prepared.session_id.clone();
         drop(prepared);
-        if let Ok(policy) = super::session_policy::get_claude_session_policy(policy_session, project_path_for_policy) {
+        if let Ok(policy) = super::session_policy::get_claude_session_policy(policy_session.clone(), project_path_for_policy) {
             let _ = app_handle_wait.emit("claude-native-policy", policy);
         }
         match exit_status {
@@ -1238,46 +1232,29 @@ async fn spawn_claude_process(
                 log::info!("Claude process exited with status: {}", status);
                 // Add a small delay to ensure all messages are processed
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                if let Some(ref session_id) = *session_id_holder_clone3.lock().unwrap() {
-                    // ✨ Phase 2: Emit state change event
-                    let event_payload = serde_json::json!({
-                        "session_id": session_id,
-                        "status": "stopped",
-                        "success": status.success(),
-                    });
-                    let _ = app_handle_wait.emit("claude-session-state", &event_payload);
-
-                    let _ = app_handle_wait
-                        .emit(&format!("claude-complete:{}", session_id), status.success());
-                }
-                // 🔒 CRITICAL FIX: 全局事件包含 tab_id
-                let global_payload = serde_json::json!({
-                    "tab_id": tab_id_for_complete,
-                    "payload": status.success()
+                let event_payload = serde_json::json!({
+                    "session_id": &policy_session,
+                    "status": "stopped",
+                    "success": status.success(),
                 });
+                let _ = app_handle_wait.emit("claude-session-state", &event_payload);
+                let _ = app_handle_wait.emit(&format!("claude-complete:{}", policy_session), status.success());
+                let global_payload = global_event_payload(&tab_id_for_complete, &policy_session, status.success());
                 let _ = app_handle_wait.emit("claude-complete", &global_payload);
             }
             Err(e) => {
                 log::error!("Failed to wait for Claude process: {}", e);
                 // Add a small delay to ensure all messages are processed
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                if let Some(ref session_id) = *session_id_holder_clone3.lock().unwrap() {
-                    // ✨ Phase 2: Emit state change event for error case
-                    let event_payload = serde_json::json!({
-                        "session_id": session_id,
-                        "status": "stopped",
-                        "success": false,
-                        "error": e.to_string(),
-                    });
-                    let _ = app_handle_wait.emit("claude-session-state", &event_payload);
-
-                    let _ = app_handle_wait.emit(&format!("claude-complete:{}", session_id), false);
-                }
-                // 🔒 CRITICAL FIX: 全局事件包含 tab_id
-                let global_payload = serde_json::json!({
-                    "tab_id": tab_id_for_complete,
-                    "payload": false
+                let event_payload = serde_json::json!({
+                    "session_id": &policy_session,
+                    "status": "stopped",
+                    "success": false,
+                    "error": e.to_string(),
                 });
+                let _ = app_handle_wait.emit("claude-session-state", &event_payload);
+                let _ = app_handle_wait.emit(&format!("claude-complete:{}", policy_session), false);
+                let global_payload = global_event_payload(&tab_id_for_complete, &policy_session, false);
                 let _ = app_handle_wait.emit("claude-complete", &global_payload);
             }
         }

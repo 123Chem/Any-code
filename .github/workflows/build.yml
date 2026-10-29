@@ -110,14 +110,82 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-      - name: Create draft release
+      - name: Create or reuse reviewed draft release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $assets = @(Get-ChildItem -LiteralPath $env:RELEASE_ROOT -File | ForEach-Object { $_.FullName })
-          gh release create $env:RELEASE_TAG @assets --draft --target "${{ github.sha }}" --title "AnyCode Windows repair $env:RELEASE_TAG" --notes "Windows repair of project/session identity, safe settings, native per-session compaction and real Claude effort. Original application data identity retained. Manual updates; install after active tasks finish. Source is the release commit."
-          if ($LASTEXITCODE -ne 0) { throw 'Draft release upload failed' }
+          $expectedCommit = "${{ github.sha }}"
+          $expectedVersion = (Get-Content -LiteralPath package.json -Raw | ConvertFrom-Json).version
+          $fileNames = @("Any-Code-$expectedVersion-x64-setup.exe", "Any-Code-$expectedVersion-x64-executable.zip")
+          $assetNames = @($fileNames) + 'build-manifest.json'
+          function Read-VerifiedBundle([string]$root) {
+            $manifest = Get-Content -LiteralPath (Join-Path $root 'build-manifest.json') -Raw | ConvertFrom-Json
+            if ($manifest.commit -cne $expectedCommit -or $manifest.tag -cne $env:RELEASE_TAG -or
+                $manifest.version -cne $expectedVersion -or $manifest.application_id -cne 'claude.workbench.app' -or
+                $manifest.platform -cne 'windows-x64' -or $manifest.profile -cne 'release' -or $manifest.rust -cne '1.88.0' -or
+                $manifest.update_mode -cne 'manual') { throw 'Release manifest identity does not match this build' }
+            $declaredNames = @($manifest.files | ForEach-Object { $_.file })
+            if ($declaredNames.Count -ne $fileNames.Count -or
+                @(Compare-Object $fileNames $declaredNames -CaseSensitive).Count) {
+              throw 'Release manifest must name exactly the reviewed installer and executable ZIP'
+            }
+            foreach ($file in $manifest.files) {
+              $path = Join-Path $root $file.file
+              if ($file.sha256 -cnotmatch '^[a-f0-9]{64}$' -or $file.bytes -le 0 -or
+                  (Get-Item -LiteralPath $path).Length -ne $file.bytes -or
+                  (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $file.sha256) {
+                throw "Release asset failed size/hash verification: $($file.file)"
+              }
+            }
+            if ($manifest.executable.file -cne 'any-code.exe' -or $manifest.executable.bytes -le 0 -or
+                $manifest.executable.sha256 -cnotmatch '^[a-f0-9]{64}$') { throw 'Invalid executable manifest' }
+            $zip = [System.IO.Compression.ZipFile]::OpenRead((Join-Path $root $fileNames[1]))
+            try {
+              if ($zip.Entries.Count -ne 1 -or $zip.Entries[0].FullName -cne 'any-code.exe' -or
+                  $zip.Entries[0].Length -ne $manifest.executable.bytes) { throw 'Executable ZIP does not match its manifest' }
+              $stream = $zip.Entries[0].Open()
+              try { $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream)).ToLowerInvariant() }
+              finally { $stream.Dispose() }
+              if ($hash -cne $manifest.executable.sha256) { throw 'Executable ZIP payload hash does not match its manifest' }
+            } finally { $zip.Dispose() }
+            return $manifest
+          }
+          function Assert-ExpectedDraft($release) {
+            if ($release.draft -isnot [bool] -or -not $release.draft -or
+                $release.target_commitish -cne $expectedCommit -or $release.tag_name -cne $env:RELEASE_TAG) {
+              throw 'Refusing to change a published release or a release targeting another commit'
+            }
+          }
+          $currentManifest = Read-VerifiedBundle $env:RELEASE_ROOT
+          $pages = gh api --paginate --slurp "repos/$env:GITHUB_REPOSITORY/releases?per_page=100"
+          if ($LASTEXITCODE -ne 0) { throw 'Release lookup failed; no release was changed' }
+          $existing = @(($pages | ConvertFrom-Json) | ForEach-Object { $_ } |
+            Where-Object { $_.tag_name -ceq $env:RELEASE_TAG })
+          if ($existing.Count -gt 1) { throw 'Release lookup returned an ambiguous tag' }
+          if ($existing.Count -eq 1) {
+            Assert-ExpectedDraft $existing[0]
+            $existingRoot = Join-Path $env:RUNNER_TEMP ('anycode-existing-' + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $existingRoot | Out-Null
+            gh release download $env:RELEASE_TAG --dir $existingRoot --pattern $assetNames[0] --pattern $assetNames[1] --pattern $assetNames[2]
+            if ($LASTEXITCODE -ne 0) { throw 'Existing draft is incomplete; no release was changed' }
+            $existingManifest = Read-VerifiedBundle $existingRoot
+            $fresh = gh api "repos/$env:GITHUB_REPOSITORY/releases/$($existing[0].id)"
+            if ($LASTEXITCODE -ne 0) { throw 'Could not recheck the existing draft' }
+            Assert-ExpectedDraft ($fresh | ConvertFrom-Json)
+            # Same source can yield different ZIP/installer bytes; preserve the first verified bundle.
+            Write-Host "Reused verified draft $env:RELEASE_TAG; existing release assets were retained."
+            if (@(Compare-Object $currentManifest.files $existingManifest.files -Property file,bytes,sha256).Count) {
+              Write-Host 'This rebuild has different bytes; its new bundle is available only in this run artifact.'
+            }
+          } else {
+            $assets = @($assetNames | ForEach-Object { Join-Path $env:RELEASE_ROOT $_ })
+            $notesPath = Join-Path $env:RUNNER_TEMP ('anycode-notes-' + [guid]::NewGuid().ToString('N') + '.md')
+            'Windows repair of project/session identity, safe settings, native per-session compaction and real Claude effort. Original application data identity retained. Manual updates; install after active tasks finish. Source is the release commit. Rebuilds retain the first complete verified draft bundle.' |
+              Set-Content -LiteralPath $notesPath -Encoding utf8
+            gh release create $env:RELEASE_TAG @assets --draft --target $expectedCommit --title "AnyCode Windows repair $env:RELEASE_TAG" --notes-file $notesPath
+            if ($LASTEXITCODE -ne 0) { throw 'Draft release upload failed' }
+          }
 
       - name: Save diagnostic output on failure
         if: failure()

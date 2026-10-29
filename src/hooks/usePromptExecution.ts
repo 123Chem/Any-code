@@ -22,6 +22,7 @@ import type { ModelType, ThinkingEffort } from '@/components/FloatingPromptInput
 import { CodexEventConverter, extractCodexRateLimitsFromEvent } from '@/lib/codexConverter';
 import type { CodexExecutionMode, CodexRateLimits } from '@/types/codex';
 import { cacheModelFromInitMessage } from '@/lib/modelNameParser';
+import { normalizeClaudeGlobalPayload, ownsClaudeGlobalEvent, type ClaudeGlobalEventPayload } from '@/lib/claudeGlobalEvent';
 
 // ============================================================================
 // Global Type Declarations
@@ -109,16 +110,6 @@ interface UsePromptExecutionConfig {
 interface UsePromptExecutionReturn {
   handleSendPrompt: (prompt: string, model: ModelType, maxThinkingTokens?: number, claudeEffort?: ThinkingEffort | null) => Promise<void>;
 }
-
-type ClaudeGlobalEventPayload<T> = { tab_id?: string | null; payload: T } | T;
-
-const normalizeClaudeGlobalPayload = <T,>(payload: ClaudeGlobalEventPayload<T>) => {
-  if (payload && typeof payload === 'object' && 'payload' in payload) {
-    const typedPayload = payload as { tab_id?: string | null; payload: T };
-    return { tabId: typedPayload.tab_id ?? null, payload: typedPayload.payload };
-  }
-  return { tabId: null, payload: payload as T };
-};
 
 // ============================================================================
 // Hook Implementation
@@ -1082,14 +1073,10 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
           // --------------------------------------------------------------------
           // Claude Code Event Listener Setup Strategy
           // --------------------------------------------------------------------
-          // Claude Code may emit a *new* session_id even when we pass --resume.
-          // If we listen only on the old session-scoped channel we will miss the
-          // stream until the user navigates away & back. To avoid this we:
-          //   • Always start with GENERIC listeners (no suffix) so we catch the
-          //     very first "system:init" message regardless of the session id.
-          //   • Once that init message provides the *actual* session_id, we
-          //     dynamically switch to session-scoped listeners and stop the
-          //     generic ones to prevent duplicate handling.
+          // New tabs use their explicit tab ID until their original UUID is known.
+          // A tabless event can reach only a tab already bound to that same UUID.
+          // Scoped events stay on the backend's prepared UUID; a resumed conversation
+          // must not adopt another init UUID to repair a missing stream.
           // --------------------------------------------------------------------
 
         let currentSessionId: string | null = claudeSessionId || effectiveSession?.id || null;
@@ -1291,42 +1278,21 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
         // ====================================================================
         // Generic Listeners (Catch-all) - FIXED to prevent cross-session data leakage
         // ====================================================================
-        // 🔒 CRITICAL FIX: 全局事件现在格式为 { tab_id: string | null, payload: string }
+        // Global envelopes carry tab_id and the worker's original session_id.
         const genericOutputUnlisten = await listen<ClaudeGlobalEventPayload<string>>('claude-output', async (event) => {
           // 🔧 CRITICAL FIX: 只在尚未收到会话ID时处理全局事件
           if (!hasActiveSessionRef.current) return;
 
-          // 🔒 CRITICAL FIX: 使用 tab_id 过滤消息，这是最可靠的会话隔离方式
-          const { tabId: eventTabId, payload: messagePayload } = normalizeClaudeGlobalPayload(event.payload);
-
-          // 如果事件包含 tab_id，则只处理匹配当前标签页的消息
-          if (eventTabId && eventTabId !== tabIdRef.current) {
-            // 消息来自不同标签页，忽略
-            return;
-          }
-
-          // 🔒 CRITICAL FIX: Session Isolation - 严格隔离全局事件处理
-          // 问题: 多个标签页都监听全局 'claude-output',导致消息被多个会话接收
-          // 解决: 只在会话ID未知的早期阶段处理全局事件
-          if (hasAttachedSessionListeners) {
-             try {
-                const msg = JSON.parse(messagePayload) as ClaudeStreamMessage;
-                // 只处理新会话的 init 消息(session_id 不同)
-                if (msg.type === 'system' && msg.subtype === 'init' && msg.session_id && msg.session_id !== currentSessionId) {
-                   // Fall through to processing below
-                } else {
-                   // ⚠️ 忽略所有其他消息 - 应该由会话特定监听器处理
-
-                   return;
-                }
-             } catch {
-                return;
-             }
-          }
+          const origin = normalizeClaudeGlobalPayload(event.payload);
+          const messagePayload = origin.payload;
+          if (typeof messagePayload !== 'string') return;
 
           // Attempt to extract session_id on the fly (for the very first init)
           try {
             const msg = JSON.parse(messagePayload) as ClaudeStreamMessage;
+            const boundSessionId = currentSessionId || claudeSessionId || effectiveSession?.id || extractedSessionInfo?.sessionId;
+            if (!ownsClaudeGlobalEvent(origin, tabIdRef.current, boundSessionId, msg.session_id)) return;
+            if (hasAttachedSessionListeners) return;
 
             // 🔒 CRITICAL FIX #1: 使用 session_id 验证消息是否属于当前会话
             // 这是最重要的检查：如果消息包含 session_id，且我们已经有 claudeSessionId，
@@ -1446,31 +1412,28 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
           }
         });
 
-        // 🔒 CRITICAL FIX: 全局事件现在格式为 { tab_id: string | null, payload: string }
+        // An error without either owner cannot be assigned to a waiting tab.
         const genericErrorUnlisten = await listen<ClaudeGlobalEventPayload<string>>('claude-error', (evt) => {
           // 🔧 FIX: Only process if this tab has an active session
           if (!hasActiveSessionRef.current) return;
 
-          // 🔒 CRITICAL FIX: 使用 tab_id 过滤消息
-          const { tabId: eventTabId, payload: errorPayload } = normalizeClaudeGlobalPayload(evt.payload);
-          if (eventTabId && eventTabId !== tabIdRef.current) {
-            return;
-          }
+          const origin = normalizeClaudeGlobalPayload(evt.payload);
+          const errorPayload = origin.payload;
+          const boundSessionId = currentSessionId || claudeSessionId || effectiveSession?.id || extractedSessionInfo?.sessionId;
+          if (typeof errorPayload !== 'string' || !ownsClaudeGlobalEvent(origin, tabIdRef.current, boundSessionId)) return;
 
           console.error('Claude error:', errorPayload);
           setError(errorPayload);
         });
 
-        // 🔒 CRITICAL FIX: 全局事件现在格式为 { tab_id: string | null, payload: boolean }
+        // Completion follows the same ownership rule as stdout and stderr.
         const genericCompleteUnlisten = await listen<ClaudeGlobalEventPayload<boolean>>('claude-complete', (evt) => {
           // 🔧 FIX: Only process if this tab has an active session
           if (!hasActiveSessionRef.current) return;
 
-          // 🔒 CRITICAL FIX: 使用 tab_id 过滤消息
-          const { tabId: eventTabId } = normalizeClaudeGlobalPayload(evt.payload);
-          if (eventTabId && eventTabId !== tabIdRef.current) {
-            return;
-          }
+          const origin = normalizeClaudeGlobalPayload(evt.payload);
+          const boundSessionId = currentSessionId || claudeSessionId || effectiveSession?.id || extractedSessionInfo?.sessionId;
+          if (typeof origin.payload !== 'boolean' || !ownsClaudeGlobalEvent(origin, tabIdRef.current, boundSessionId)) return;
 
           processComplete();
         });
