@@ -48,6 +48,7 @@ jobs:
         with:
           workspaces: "./src-tauri -> target"
           key: windows-repair-release
+          cache-on-failure: true
 
       - name: Use native Windows Perl
         shell: pwsh

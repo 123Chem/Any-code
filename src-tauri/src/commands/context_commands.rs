@@ -80,7 +80,7 @@ pub async fn trigger_manual_compaction(
     let prompt = custom_instructions.filter(|value| !value.trim().is_empty())
         .map(|value| format!("/compact {value}")).unwrap_or_else(|| "/compact".to_owned());
     crate::commands::claude::resume_claude_code(app, context.project_path, session_id,
-        prompt, context.model, None, None, None, None).await
+        prompt, context.model, None, None, None, None, None).await
 }
 
 /// Get auto-compact configuration
