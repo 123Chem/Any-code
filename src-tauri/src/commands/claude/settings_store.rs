@@ -360,8 +360,12 @@ mod tests {
         let digest = format!("{:x}", Sha256::digest(before));
         let backup = root.join(format!("settings.before-anycode-repair-{digest}.json"));
         assert_eq!(fs::read(&backup).unwrap(), before);
-        assert!(FileAccess::capture(&path).unwrap() == original_access);
-        assert!(FileAccess::capture(&backup).unwrap() == original_access);
+        let published_access = FileAccess::capture(&path).unwrap();
+        let backup_access = FileAccess::capture(&backup).unwrap();
+        assert!(published_access == original_access, "Published ACL changed: {} -> {}",
+                original_access.diagnostic(), published_access.diagnostic());
+        assert!(backup_access == original_access, "Backup ACL changed: {} -> {}",
+                original_access.diagnostic(), backup_access.diagnostic());
         assert_eq!(read(&path).unwrap(), saved);
     }
 

@@ -14,6 +14,8 @@ pub(crate) mod settings_store;
 pub(crate) mod session_policy;
 pub(crate) mod session_metadata;
 mod managed_policy;
+#[cfg(test)]
+mod process_lock_tests;
 pub use session_policy::{get_claude_session_policy, set_claude_session_policy, set_claude_session_effort};
 
 pub use models::*;
