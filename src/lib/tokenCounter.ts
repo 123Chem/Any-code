@@ -303,13 +303,17 @@ export function getContextWindowSize(model?: string, engine?: string): number {
   // Claude 引擎（默认）
   if (!model) return CLAUDE_CONTEXT_WINDOWS['default'];
 
+  const claudeModel = model.trim().toLowerCase();
+  // An explicit context suffix is a display hint; native runtime metadata takes precedence.
+  if (/(?:\[1m\]|-1m)$/.test(claudeModel)) return 1_000_000;
+
   // 尝试直接匹配
-  if (model in CLAUDE_CONTEXT_WINDOWS) {
-    return CLAUDE_CONTEXT_WINDOWS[model as keyof typeof CLAUDE_CONTEXT_WINDOWS];
+  if (claudeModel in CLAUDE_CONTEXT_WINDOWS) {
+    return CLAUDE_CONTEXT_WINDOWS[claudeModel as keyof typeof CLAUDE_CONTEXT_WINDOWS];
   }
 
   // 尝试通过别名匹配
-  const normalizedModel = MODEL_ALIASES[model as keyof typeof MODEL_ALIASES];
+  const normalizedModel = MODEL_ALIASES[claudeModel as keyof typeof MODEL_ALIASES];
   if (normalizedModel && normalizedModel in CLAUDE_CONTEXT_WINDOWS) {
     return CLAUDE_CONTEXT_WINDOWS[normalizedModel as keyof typeof CLAUDE_CONTEXT_WINDOWS];
   }

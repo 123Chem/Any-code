@@ -94,6 +94,9 @@ export const ControlBar: React.FC<ControlBarProps> = ({
 }) => {
   const { t } = useTranslation();
 
+  // Use the sender's Opus alias for Fast and its configured name for a custom selection.
+  const claudeContextModel = executionEngineConfig.claudeFastMode ? 'opus'
+    : selectedModel === 'custom' ? availableModels.find(model => model.id === 'custom')?.name : selectedModel;
   const contextWindowModel =
     executionEngineConfig.engine === 'codex'
       ? (executionEngineConfig.codexFastMode && (session?.model || executionEngineConfig.codexModel)?.includes('gpt-5.5')
@@ -101,7 +104,7 @@ export const ControlBar: React.FC<ControlBarProps> = ({
         : (session?.model || executionEngineConfig.codexModel))
       : executionEngineConfig.engine === 'gemini'
         ? (executionEngineConfig.geminiModel || session?.model)
-        : (executionEngineConfig.claudeFastMode ? 'claude-opus-4-7-fast' : selectedModel);
+        : claudeContextModel;
 
   // Extract latest Codex rate limits from messages
   const codexRateLimits = useMemo<CodexRateLimits | null>(() => {

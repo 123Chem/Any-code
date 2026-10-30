@@ -20,6 +20,7 @@
 
 import { useMemo } from 'react';
 import { getContextWindowSize } from '@/lib/tokenCounter';
+import { resolveClaudeContext } from '@/lib/claudeContextWindow';
 import { normalizeUsageData } from '@/lib/utils';
 import { ContextWindowUsage, ContextUsageLevel, getUsageLevel } from '@/types/contextWindow';
 import type { ClaudeStreamMessage } from '@/types/claude';
@@ -192,7 +193,9 @@ export function useContextWindowUsage(
 ): UseContextWindowUsageResult {
   return useMemo(() => {
     // 获取上下文窗口大小（根据引擎和模型）
-    let contextWindowSize = getContextWindowSize(model, engine);
+    const claudeContext = engine === 'claude' ? resolveClaudeContext(messages, model) : undefined;
+    const currentMessages = claudeContext?.messages ?? messages;
+    let contextWindowSize = claudeContext?.contextWindowSize ?? getContextWindowSize(model, engine);
 
     // Codex: prefer runtime-reported context window when available (token_count events)
     if (engine === 'codex') {
@@ -206,8 +209,8 @@ export function useContextWindowUsage(
       }
     }
 
-    // Claude/Gemini: prefer runtime-reported context window when available (statusline/hook payloads)
-    if (engine === 'claude' || engine === 'gemini') {
+    // Gemini: preserve its runtime-reported window handling. Claude is resolved above.
+    if (engine === 'gemini') {
       for (let i = messages.length - 1; i >= 0; i--) {
         const maybeCtx =
           (messages[i] as any)?.context_window?.context_window_size ??
@@ -243,7 +246,7 @@ export function useContextWindowUsage(
     }
 
     // 注意：这里的 usage 代表当前使用量快照（最后一条可用 usage），而不是增量累加。
-    const currentUsage = extractCurrentUsage(messages, engine, contextWindowSize);
+    const currentUsage = extractCurrentUsage(currentMessages, engine, contextWindowSize);
 
     if (!currentUsage) {
       return defaultResult;
