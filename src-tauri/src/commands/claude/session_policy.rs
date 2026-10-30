@@ -356,16 +356,22 @@ fn prepare_for_root(cmd: &mut Command, project: &str, root: &Path, effort: Optio
         save_policy_field(root, &policy, "configured_effort", json!(effective_effort))?;
     }
     let mut settings = json!({});
+    let mut overlay_env = serde_json::Map::new();
     if let Some(percent) = policy.configured_percent {
-        settings["env"] = json!({"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": percent.to_string()});
+        overlay_env.insert("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE".into(), Value::String(percent.to_string()));
     }
     if let Some(memory) = prepared_memory(Path::new(project), &root)? {
         settings["autoMemoryDirectory"] = Value::String(memory);
     }
     if let Some(effort) = effective_effort {
-        // The CLI flag wins over shared defaults without changing another worker.
+        // A valid CLAUDE_CODE_EFFORT_LEVEL in user/project settings.env beats both
+        // --effort and the process env; only the flag-settings layer outranks it.
         cmd.arg("--effort").arg(effort.as_str());
         cmd.env("CLAUDE_CODE_EFFORT_LEVEL", effort.as_str());
+        overlay_env.insert("CLAUDE_CODE_EFFORT_LEVEL".into(), Value::String(effort.as_str().into()));
+    }
+    if !overlay_env.is_empty() {
+        settings["env"] = Value::Object(overlay_env);
     }
     if !settings.as_object().expect("settings object").is_empty() {
         if args.iter().any(|arg| arg == "--settings") {

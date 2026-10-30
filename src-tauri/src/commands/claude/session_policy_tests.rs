@@ -179,7 +179,10 @@ fn new_max_is_saved_with_the_uuid_without_changing_shared_settings_or_auth() {
     cmd.env("ANTHROPIC_AUTH_TOKEN", "fixture-auth").env("CLAUDE_CODE_EFFORT_LEVEL", "low");
     let prepared = prepare_for_root(&mut cmd, project.to_str().unwrap(), &root, Some(ClaudeEffort::Max.into())).unwrap();
     let args: Vec<_> = cmd.as_std().get_args().map(|value| value.to_string_lossy().to_string()).collect();
-    assert_eq!(args, vec!["--effort", "max", "--session-id", &prepared.session_id]);
+    assert_eq!(args[..2], ["--effort", "max"]);
+    assert_eq!(args.last().unwrap(), &prepared.session_id);
+    // The shared settings.env level would beat --effort; the flag overlay must carry the session level.
+    assert_eq!(settings_overlay(&cmd), json!({"env": {"CLAUDE_CODE_EFFORT_LEVEL": "max"}}));
     let policy = load(&root, &prepared.session_id, &project).unwrap();
     assert_eq!(policy.configured_effort, Some(ClaudeEffort::Max));
     assert_eq!(policy.observation.applied_effort, Some(ClaudeEffort::Max));
@@ -203,7 +206,8 @@ fn resume_keeps_saved_max_and_sixty_with_original_session_guard() {
     let args: Vec<_> = cmd.as_std().get_args().map(|value| value.to_string_lossy().to_string()).collect();
     assert_eq!(args.iter().filter(|arg| *arg == "--effort").count(), 1);
     assert_eq!(args.windows(2).find(|pair| pair[0] == "--effort").unwrap()[1], "max");
-    assert_eq!(settings_overlay(&cmd), json!({"env": {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "60"}}));
+    assert_eq!(settings_overlay(&cmd), json!({"env": {
+        "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "60", "CLAUDE_CODE_EFFORT_LEVEL": "max"}}));
     assert_eq!(prepared.session_id, id);
     assert!(shared_lease(&root, &prepared.key).is_err());
 }
