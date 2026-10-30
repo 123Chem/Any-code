@@ -125,7 +125,8 @@ describe('Claude effort forwarding across prompt execution paths', () => {
     config.queuedPromptsRef.current = [{ id: 'queued', prompt: 'queued offline', model: 'opus', claudeEffort: 'max' }];
     rerender({ knownId: FIRST, first: false });
     await act(async () => {
-      await handlers.get(`claude-complete:${FIRST}`)!({ event: `claude-complete:${FIRST}`, id: 2, payload: true });
+      await handlers.get('claude-complete')!({ event: 'claude-complete', id: 2,
+        payload: { tab_id: tabId, session_id: FIRST, payload: true } });
     });
     await waitFor(() => expect(api.resumeClaudeCode).toHaveBeenCalledWith('D:/one', FIRST, 'queued offline', 'opus', false,
       undefined, tabId, false, 'max'));

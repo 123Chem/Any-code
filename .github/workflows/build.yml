@@ -181,7 +181,7 @@ jobs:
           } else {
             $assets = @($assetNames | ForEach-Object { Join-Path $env:RELEASE_ROOT $_ })
             $notesPath = Join-Path $env:RUNNER_TEMP ('anycode-notes-' + [guid]::NewGuid().ToString('N') + '.md')
-            'Windows repair of project/session identity, safe settings, native per-session compaction and real Claude effort. Original application data identity retained. Manual updates; install after active tasks finish. Source is the release commit. Rebuilds retain the first complete verified draft bundle.' |
+            'Fix Claude response completion, background-tab listeners, cancelled preparation and missed terminal events. Bound output draining only after process exit, and reject oversized settings before publication. Original session identity, native effort and compaction remain supported. Manual updates; install after active tasks finish. Source is the release commit. Rebuilds retain the first complete verified draft bundle.' |
               Set-Content -LiteralPath $notesPath -Encoding utf8
             gh release create $env:RELEASE_TAG @assets --draft --target $expectedCommit --title "AnyCode Windows repair $env:RELEASE_TAG" --notes-file $notesPath
             if ($LASTEXITCODE -ne 0) { throw 'Draft release upload failed' }

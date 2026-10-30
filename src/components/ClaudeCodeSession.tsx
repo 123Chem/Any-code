@@ -428,7 +428,7 @@ const ClaudeCodeSessionInner: React.FC<ClaudeCodeSessionProps> = ({
   }, [executionEngineConfig.engine, effectiveSession?.id]);
 
   // ✅ Refactored: Use custom Hook for prompt execution (AFTER all other Hooks)
-  const { handleSendPrompt } = usePromptExecution({
+  const { handleSendPrompt, cancelPendingPrompt } = usePromptExecution({
     projectPath,
     isLoading,
     claudeSessionId,
@@ -674,10 +674,11 @@ const ClaudeCodeSessionInner: React.FC<ClaudeCodeSessionProps> = ({
     if (!isLoading) return;
 
     try {
+      const cancelledBeforeDispatch = cancelPendingPrompt();
       // 🆕 根据执行引擎调用相应的取消方法
       if (executionEngineConfig.engine === 'codex') {
         await api.cancelCodex(claudeSessionId || undefined);
-      } else {
+      } else if (!cancelledBeforeDispatch) {
         await api.cancelClaudeExecution(claudeSessionId || undefined);
       }
       

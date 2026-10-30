@@ -228,6 +228,10 @@ pub fn update(path: &Path, desired: &Value, baseline: Option<&Value>) -> Result<
     if result == current {
         return Ok(result);
     }
+    let bytes = serde_json::to_vec_pretty(&result).map_err(|_| "Cannot encode Claude settings")?;
+    if bytes.len() as u64 > MAX_SETTINGS_BYTES {
+        return Err("Claude settings output exceeds the 4 MiB read budget; original file was not changed".into());
+    }
     let access = original.as_ref().map(|_| FileAccess::capture(path)).transpose()?;
     if let Some(bytes) = &original {
         let digest = format!("{:x}", Sha256::digest(bytes));
@@ -251,7 +255,6 @@ pub fn update(path: &Path, desired: &Value, baseline: Option<&Value>) -> Result<
     let mut file = OpenOptions::new().write(true).create_new(true).open(&staged)
         .map_err(|error| format!("Cannot stage Claude settings: {error}"))?;
     if let Some(access) = &access { access.apply(&staged)?; }
-    let bytes = serde_json::to_vec_pretty(&result).map_err(|_| "Cannot encode Claude settings")?;
     file.write_all(&bytes).and_then(|_| file.sync_all())
         .map_err(|error| format!("Cannot stage Claude settings: {error}"))?;
     drop(file);
@@ -288,6 +291,55 @@ fn shared_writer(directory: &Path) -> Result<File, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    mod budget_regressions {
+        use super::*;
+
+        fn original_file(value: &Value) -> (std::path::PathBuf, Vec<u8>) {
+            let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("verification")
+                .join(format!("settings-budget-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&directory).unwrap();
+            let path = directory.join("settings.json");
+            let bytes = serde_json::to_vec(value).unwrap();
+            assert!(parse(&bytes).is_ok());
+            fs::write(&path, &bytes).unwrap();
+            (path, bytes)
+        }
+
+        fn assert_unchanged(path: &Path, original: &[u8]) {
+            assert_eq!(fs::read(path).unwrap(), original);
+            let mut names: Vec<_> = fs::read_dir(path.parent().unwrap()).unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            names.sort();
+            assert_eq!(names, ["codex-settings-write.lock", "settings.json"]);
+        }
+
+        #[test]
+        fn merged_output_over_budget_is_rejected_before_backup_or_staging() {
+            let current = json!({"external": "a".repeat(2 * 1024 * 1024 + 64)});
+            let desired = json!({"edited": "b".repeat(2 * 1024 * 1024 + 64)});
+            let (path, original) = original_file(&current);
+            assert!(parse(&serde_json::to_vec(&desired).unwrap()).is_ok());
+            let result = update(&path, &desired, Some(&json!({})));
+            assert!(matches!(result, Err(error) if error.contains("4 MiB")));
+            assert_unchanged(&path, &original);
+        }
+
+        #[test]
+        fn pretty_output_over_budget_is_rejected_before_backup_or_staging() {
+            let mut desired = json!({"notes": "", "mode": "b"});
+            let overhead = serde_json::to_vec(&desired).unwrap().len();
+            desired["notes"] = Value::String("a".repeat(MAX_SETTINGS_BYTES as usize - overhead));
+            let mut current = desired.clone();
+            current["mode"] = Value::String("a".into());
+            let (path, original) = original_file(&current);
+            assert_eq!(original.len() as u64, MAX_SETTINGS_BYTES);
+            assert!(parse(&serde_json::to_vec(&desired).unwrap()).is_ok());
+            let result = update(&path, &desired, Some(&current));
+            assert!(matches!(result, Err(error) if error.contains("4 MiB")));
+            assert_unchanged(&path, &original);
+        }
+    }
 
     #[test]
     fn partial_env_preserves_credentials_and_unknown_fields() {

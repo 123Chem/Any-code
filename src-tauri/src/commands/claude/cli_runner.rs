@@ -1216,30 +1216,37 @@ async fn spawn_claude_process(
     let tab_id_for_complete = tab_id;
     let project_path_for_policy = project_path.clone();
     tokio::spawn(async move {
-        let _ = stdout_task.await;
-        let _ = stderr_task.await;
-
         // 🔒 CRITICAL FIX: 直接等待 child，不再从全局 state 取出
         // child 已经被移动到这个 async block 中
         let exit_status = child.wait().await;
+        // Readers already run concurrently. Bound their drain only after the
+        // worker exits; a live model request has no new timeout here.
+        let output_status = super::output_drain::after_exit(
+            stdout_task, stderr_task, std::time::Duration::from_secs(10)).await;
         let policy_session = prepared.session_id.clone();
         drop(prepared);
         if let Ok(policy) = super::session_policy::get_claude_session_policy(policy_session.clone(), project_path_for_policy) {
             let _ = app_handle_wait.emit("claude-native-policy", policy);
         }
+        if let Err(error) = output_status {
+            let _ = app_handle_wait.emit(&format!("claude-error:{}", policy_session), error);
+            let payload = global_event_payload(&tab_id_for_complete, &policy_session, error);
+            let _ = app_handle_wait.emit("claude-error", payload);
+        }
         match exit_status {
             Ok(status) => {
                 log::info!("Claude process exited with status: {}", status);
+                let success = status.success() && output_status.is_ok();
                 // Add a small delay to ensure all messages are processed
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 let event_payload = serde_json::json!({
                     "session_id": &policy_session,
                     "status": "stopped",
-                    "success": status.success(),
+                    "success": success,
                 });
                 let _ = app_handle_wait.emit("claude-session-state", &event_payload);
-                let _ = app_handle_wait.emit(&format!("claude-complete:{}", policy_session), status.success());
-                let global_payload = global_event_payload(&tab_id_for_complete, &policy_session, status.success());
+                let _ = app_handle_wait.emit(&format!("claude-complete:{}", policy_session), success);
+                let global_payload = global_event_payload(&tab_id_for_complete, &policy_session, success);
                 let _ = app_handle_wait.emit("claude-complete", &global_payload);
             }
             Err(e) => {

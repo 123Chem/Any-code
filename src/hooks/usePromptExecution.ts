@@ -13,7 +13,7 @@
  */
 
 import { useCallback, useRef, useEffect } from 'react';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { listen, type EventCallback, type UnlistenFn } from '@tauri-apps/api/event';
 import { api, type Session } from '@/lib/api';
 import { translationMiddleware, isSlashCommand, type TranslationResult } from '@/lib/translationMiddleware';
 import type { ClaudeStreamMessage } from '@/types/claude';
@@ -23,6 +23,7 @@ import { CodexEventConverter, extractCodexRateLimitsFromEvent } from '@/lib/code
 import type { CodexExecutionMode, CodexRateLimits } from '@/types/codex';
 import { cacheModelFromInitMessage } from '@/lib/modelNameParser';
 import { normalizeClaudeGlobalPayload, ownsClaudeGlobalEvent, type ClaudeGlobalEventPayload } from '@/lib/claudeGlobalEvent';
+import { watchClaudeCompletion } from '@/lib/claudeCompletionWatch';
 
 // ============================================================================
 // Global Type Declarations
@@ -109,6 +110,7 @@ interface UsePromptExecutionConfig {
 
 interface UsePromptExecutionReturn {
   handleSendPrompt: (prompt: string, model: ModelType, maxThinkingTokens?: number, claudeEffort?: ThinkingEffort | null) => Promise<void>;
+  cancelPendingPrompt: () => boolean;
 }
 
 // ============================================================================
@@ -171,6 +173,18 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
   const currentOwnerKey = useRef(ownerKey);
   currentOwnerKey.current = ownerKey;
   const sendPromptRef = useRef<UsePromptExecutionReturn['handleSendPrompt'] | null>(null);
+  const sendGenerationRef = useRef(0);
+  const preparingSendRef = useRef<number | null>(null);
+
+  useEffect(() => () => { sendGenerationRef.current += 1; }, []);
+
+  const cancelPendingPrompt = useCallback(() => {
+    if (executionEngine !== 'claude' || preparingSendRef.current === null) return false;
+    sendGenerationRef.current += 1;
+    preparingSendRef.current = null;
+    hasActiveSessionRef.current = false;
+    return true;
+  }, [executionEngine, hasActiveSessionRef]);
 
   const codexThreadIdRef = useRef<string | null>(null);
 
@@ -269,7 +283,7 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
     const isSlashCommandInput = isSlashCommand(prompt);
 
     // If already loading, queue the prompt
-    if (isLoading) {
+    if (isLoading || hasActiveSessionRef.current) {
       const newPrompt: QueuedPrompt = {
         id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
         prompt,
@@ -281,15 +295,41 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
       return;
     }
 
+    const requestGeneration = ++sendGenerationRef.current;
+    const isCurrentSend = () => requestGeneration === sendGenerationRef.current
+      && isMountedRef.current && hasActiveSessionRef.current;
+    const canDispatch = () => isCurrentSend() && currentOwnerKey.current === requestOwnerKey;
+    const ownedListeners: UnlistenFn[] = [];
+    const disposeOwnedListeners = () => {
+      ownedListeners.splice(0).forEach(unlisten => {
+        unlisten();
+        unlistenRefs.current = unlistenRefs.current.filter(current => current !== unlisten);
+      });
+    };
+    const retainListener = (unlisten: UnlistenFn) => {
+      ownedListeners.push(unlisten);
+      unlistenRefs.current.push(unlisten);
+    };
+    const listenForClaude = async <T,>(name: string, handler: EventCallback<T>) => {
+      const unlisten = await listen<T>(name, handler);
+      if (!canDispatch()) {
+        unlisten();
+        disposeOwnedListeners();
+        throw new Error('Claude send was cancelled during listener setup');
+      }
+      retainListener(unlisten);
+    };
+
     try {
       setIsLoading(true);
       setError(null);
       hasActiveSessionRef.current = true;
+      preparingSendRef.current = executionEngine === 'claude' ? requestGeneration : null;
 
       // Freeze the logical Chinese project identity before this worker can emit init.
       const claudeProjectId = executionEngine === 'claude'
         ? await api.resolveClaudeProjectIdentity(projectPath) : '';
-      if (currentOwnerKey.current !== requestOwnerKey || !isMountedRef.current) return;
+      if (!canDispatch()) return;
 
       // Record prompt sent (save Git state before sending)
       // Only record real user input, exclude auto Warmup and Skills messages
@@ -347,6 +387,7 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
       }
 
       // Translation state
+      if (executionEngine === 'claude' && !canDispatch()) return;
       let processedPrompt = prompt;
       let userInputTranslation: TranslationResult | null = null;
 
@@ -359,7 +400,7 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
       // 2️⃣ Event Listener Setup (Only for Active Tabs)
       // ========================================================================
 
-      if (!isListeningRef.current && isActive) {
+      if (!isListeningRef.current && (isActive || executionEngine === 'claude')) {
         // Clean up previous listeners
         unlistenRefs.current.forEach(unlisten => unlisten && typeof unlisten === 'function' && unlisten());
         unlistenRefs.current = [];
@@ -1081,9 +1122,13 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
 
         let currentSessionId: string | null = claudeSessionId || effectiveSession?.id || null;
 
-        // 🔧 FIX: Track whether we've switched to session-specific listeners
-        // Only ignore generic messages AFTER we've attached session-specific listeners
-        let hasAttachedSessionListeners = false;
+        // Keep the owner-checked channel for the whole turn; channel handovers
+        // can otherwise discard output while the scoped listener is registering.
+        let completed = false;
+        let watchingCompletion = false;
+        const ownsCurrentTurn = () => isCurrentSend() && !completed
+          && (currentOwnerKey.current === requestOwnerKey || currentOwnerKey.current
+            === `${executionEngine}\0${projectPath}\0${currentSessionId || ''}`);
 
         // 🔧 FIX: Track processed message IDs to prevent duplicates from global and session-specific channels
         const processedClaudeMessages = new Set<string>();
@@ -1112,87 +1157,12 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
         };
 
         // ====================================================================
-        // Helper: Attach Session-Specific Listeners
-        // ====================================================================
-        const attachSessionSpecificListeners = async (sid: string) => {
-          // 🔧 FIX: Mark that we've attached session-specific listeners
-          hasAttachedSessionListeners = true;
-
-          const specificOutputUnlisten = await listen<string>(`claude-output:${sid}`, async (evt) => {
-            handleStreamMessage(evt.payload, userInputTranslation || undefined);
-            
-            // Handle user message recording in session-specific listener
-            try {
-              const msg = JSON.parse(evt.payload) as ClaudeStreamMessage;
-              
-              // 在收到第一条 user 消息后记录
-              if (msg.type === 'user' && !hasRecordedPrompt && isUserInitiated) {
-                // 检查这是否是我们发送的那条消息（通过内容匹配）
-                let isOurMessage = false;
-                const msgContent: any = msg.message?.content;
-                
-                if (msgContent) {
-                  if (typeof msgContent === 'string') {
-                    const contentStr = msgContent as string;
-                    isOurMessage = contentStr.includes(prompt) || prompt.includes(contentStr);
-                  } else if (Array.isArray(msgContent)) {
-                    const textContent = msgContent
-                      .filter((item: any) => item.type === 'text')
-                      .map((item: any) => item.text)
-                      .join('');
-                    isOurMessage = textContent.includes(prompt) || prompt.includes(textContent);
-                  }
-                }
-                
-                if (isOurMessage) {
-                  const projectId = claudeProjectId;
-                  // 🔧 FIX: Store Promise to allow processComplete to wait for it
-                  pendingClaudePromptRecordingPromise = (async () => {
-                    try {
-                      // 添加延迟以确保文件写入完成
-                      await new Promise(resolve => setTimeout(resolve, 100));
-
-                      recordedPromptIndex = await api.recordPromptSent(
-                        sid,
-                        projectId,
-                        projectPath,
-                        prompt
-                      );
-                      hasRecordedPrompt = true;
-                      
-                    } catch (err) {
-                      console.error('[Prompt Revert] [ERROR] Failed to record prompt:', err);
-                    }
-                  })();
-                }
-              }
-            } catch {
-              /* ignore parse errors */
-            }
-          });
-
-          const specificErrorUnlisten = await listen<string>(`claude-error:${sid}`, (evt) => {
-            console.error('Claude error (scoped):', evt.payload);
-            setError(evt.payload);
-          });
-
-          const specificCompleteUnlisten = await listen<boolean>(`claude-complete:${sid}`, () => {
-            
-            processComplete();
-          });
-
-          // Replace existing unlisten refs with these new ones (after cleaning up)
-          unlistenRefs.current.forEach((u) => u && typeof u === 'function' && u());
-          unlistenRefs.current = [specificOutputUnlisten, specificErrorUnlisten, specificCompleteUnlisten];
-        };
-
-        // ====================================================================
         // Helper: Process Stream Message
         // ====================================================================
         async function handleStreamMessage(payload: string, currentTranslationResult?: TranslationResult) {
           try {
             // Don't process if component unmounted
-            if (!isMountedRef.current) return;
+            if (!ownsCurrentTurn()) return;
 
             // 🔧 FIX: Deduplicate messages to prevent duplicate processing
             // This can happen when both global and session-specific listeners receive the same message
@@ -1218,50 +1188,27 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
         // ====================================================================
         // Helper: Process Completion
         // ====================================================================
-        const processComplete = async () => {
-          
-
-          // 🔧 FIX: Wait for pending prompt recording to complete (race condition fix)
-          if (pendingClaudePromptRecordingPromise) {
+        const processComplete = (advanceQueue = true) => {
+          if (!ownsCurrentTurn()) return;
+          completed = true;
+          const completedSessionId = currentSessionId;
+          // Optional rewind bookkeeping must not hold the UI or clean up a later turn.
+          void (async () => {
             await pendingClaudePromptRecordingPromise;
-            pendingClaudePromptRecordingPromise = null;
-          }
-
-          // Mark prompt as completed (record Git state after completion)
-          if (recordedPromptIndex >= 0) {
-            // Use currentSessionId and extractedSessionInfo for new sessions
-            const sessionId = effectiveSession?.id || currentSessionId;
-            const projectId = claudeProjectId;
-            
-            if (sessionId && projectId) {
-              api.markPromptCompleted(
-                sessionId,
-                projectId,
-                projectPath,
-                recordedPromptIndex,
-                prompt
-              ).then(() => {
-              }).catch(err => {
-                console.error('[Prompt Revert] Failed to mark completed:', err);
-              });
-            } else {
-              console.warn('[Prompt Revert] Cannot mark completed: missing sessionId or projectId');
+            if (requestGeneration !== sendGenerationRef.current) return;
+            if (recordedPromptIndex >= 0 && completedSessionId && claudeProjectId) {
+              await api.markPromptCompleted(completedSessionId, claudeProjectId,
+                projectPath, recordedPromptIndex, prompt);
             }
-          }
-
+          })().catch(err => { console.error('[Prompt Revert] Failed to mark completed:', err); });
           setIsLoading(false);
           hasActiveSessionRef.current = false;
           isListeningRef.current = false;
-
-          // 🆕 Clean up listeners to prevent memory leak
-          unlistenRefs.current.forEach(u => u && typeof u === 'function' && u());
-          unlistenRefs.current = [];
-
-          const completedSessionId = currentSessionId;
+          disposeOwnedListeners();
           // Reset listener-local state only after retaining the queue's original owner.
           currentSessionId = null;
           // Process queued prompts after completion
-          if (queuedPromptsRef.current.length > 0) {
+          if (advanceQueue && queuedPromptsRef.current.length > 0) {
             const [nextPrompt, ...remainingPrompts] = queuedPromptsRef.current;
             setQueuedPrompts(remainingPrompts);
 
@@ -1272,6 +1219,29 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
           }
         };
 
+        const watchForMissedCompletion = (sid: string) => {
+          if (watchingCompletion) return;
+          watchingCompletion = true;
+          retainListener(watchClaudeCompletion({
+            sessionId: sid, projectPath, isCurrent: ownsCurrentTurn,
+            readPolicy: () => api.getClaudeSessionPolicy(sid, projectPath),
+            onEnded: async () => {
+              try {
+                const history = await api.loadSessionHistory(sid, claudeProjectId, 'claude');
+                if (!ownsCurrentTurn()) return;
+                if (!Array.isArray(history)) throw new Error('Invalid session history');
+                setMessages(history);
+                setRawJsonlOutput(history.map(message => JSON.stringify(message)));
+              } catch {
+                if (!ownsCurrentTurn()) return;
+                setError('本次运行已结束，但未能重新读取结果。请查看原会话记录后再决定是否重试。');
+              }
+              // Recover the original result; never resend work because an event was missed.
+              processComplete(false);
+            },
+          }));
+        };
+
         // Track if we've recorded the prompt for new sessions
         let hasRecordedPrompt = recordedPromptIndex >= 0;
 
@@ -1279,9 +1249,9 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
         // Generic Listeners (Catch-all) - FIXED to prevent cross-session data leakage
         // ====================================================================
         // Global envelopes carry tab_id and the worker's original session_id.
-        const genericOutputUnlisten = await listen<ClaudeGlobalEventPayload<string>>('claude-output', async (event) => {
+        await listenForClaude<ClaudeGlobalEventPayload<string>>('claude-output', async (event) => {
           // 🔧 CRITICAL FIX: 只在尚未收到会话ID时处理全局事件
-          if (!hasActiveSessionRef.current) return;
+          if (!ownsCurrentTurn()) return;
 
           const origin = normalizeClaudeGlobalPayload(event.payload);
           const messagePayload = origin.payload;
@@ -1292,7 +1262,6 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
             const msg = JSON.parse(messagePayload) as ClaudeStreamMessage;
             const boundSessionId = currentSessionId || claudeSessionId || effectiveSession?.id || extractedSessionInfo?.sessionId;
             if (!ownsClaudeGlobalEvent(origin, tabIdRef.current, boundSessionId, msg.session_id)) return;
-            if (hasAttachedSessionListeners) return;
 
             // 🔒 CRITICAL FIX #1: 使用 session_id 验证消息是否属于当前会话
             // 这是最重要的检查：如果消息包含 session_id，且我们已经有 claudeSessionId，
@@ -1305,7 +1274,7 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
             // 🔒 CRITICAL FIX #2: 使用 cwd 字段作为备选验证（不同项目的情况）
             // 多会话并发时，不同项目的消息会通过全局事件广播
             // 通过检查 cwd 确保只处理属于当前项目的消息
-            if (msg.cwd && !claudeSessionId) {
+            if (msg.cwd && !currentSessionId) {
               // 只有在还没有 session_id 时才使用 cwd 检查
               const normalizePath = (p: string) => p.replace(/\\/g, '/').toLowerCase().replace(/\/+$/, '');
               const msgCwd = normalizePath(msg.cwd);
@@ -1360,9 +1329,8 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
                   })();
                 }
 
-                // Switch to session-specific listeners
-                await attachSessionSpecificListeners(msg.session_id);
               }
+              watchForMissedCompletion(msg.session_id);
             }
             
             // Record after first user message (user message already written to JSONL)
@@ -1413,9 +1381,9 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
         });
 
         // An error without either owner cannot be assigned to a waiting tab.
-        const genericErrorUnlisten = await listen<ClaudeGlobalEventPayload<string>>('claude-error', (evt) => {
+        await listenForClaude<ClaudeGlobalEventPayload<string>>('claude-error', (evt) => {
           // 🔧 FIX: Only process if this tab has an active session
-          if (!hasActiveSessionRef.current) return;
+          if (!ownsCurrentTurn()) return;
 
           const origin = normalizeClaudeGlobalPayload(evt.payload);
           const errorPayload = origin.payload;
@@ -1427,9 +1395,9 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
         });
 
         // Completion follows the same ownership rule as stdout and stderr.
-        const genericCompleteUnlisten = await listen<ClaudeGlobalEventPayload<boolean>>('claude-complete', (evt) => {
+        await listenForClaude<ClaudeGlobalEventPayload<boolean>>('claude-complete', (evt) => {
           // 🔧 FIX: Only process if this tab has an active session
-          if (!hasActiveSessionRef.current) return;
+          if (!ownsCurrentTurn()) return;
 
           const origin = normalizeClaudeGlobalPayload(evt.payload);
           const boundSessionId = currentSessionId || claudeSessionId || effectiveSession?.id || extractedSessionInfo?.sessionId;
@@ -1437,9 +1405,6 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
 
           processComplete();
         });
-
-        // Store the generic unlisteners for now; they may be replaced later.
-        unlistenRefs.current = [genericOutputUnlisten, genericErrorUnlisten, genericCompleteUnlisten];
 
         } // End of Claude Code event listener setup
 
@@ -1465,6 +1430,7 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
         }
 
         // Store the translation result AFTER all processing for response translation
+        if (executionEngine === 'claude' && !canDispatch()) { disposeOwnedListeners(); return; }
         if (userInputTranslation) {
           setLastTranslationResult(userInputTranslation);
         }
@@ -1646,7 +1612,8 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
         // ====================================================================
         // 🔧 Fix: 使用 isPlanModeRef.current 获取最新值，确保批准计划后不带 --plan
         const currentPlanMode = isPlanModeRef.current;
-        if (currentOwnerKey.current !== requestOwnerKey || !isMountedRef.current) return;
+        if (!canDispatch()) { disposeOwnedListeners(); return; }
+        preparingSendRef.current = null;
         // 🔒 CRITICAL FIX: 传递 tabId 用于全局事件过滤
         const tabId = tabIdRef.current;
         const resumeSessionId = effectiveSession?.id || claudeSessionId || extractedSessionInfo?.sessionId;
@@ -1661,7 +1628,8 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
       }
 
     } catch (err) {
-      if (currentOwnerKey.current !== requestOwnerKey || !isMountedRef.current) return;
+      if (requestGeneration !== sendGenerationRef.current
+          || currentOwnerKey.current !== requestOwnerKey || !isMountedRef.current) return;
       // ========================================================================
       // 7️⃣ Error Handling
       // ========================================================================
@@ -1669,6 +1637,9 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
       setError(err instanceof Error ? err.message : String(err));
       setIsLoading(false);
       hasActiveSessionRef.current = false;
+      preparingSendRef.current = null;
+      isListeningRef.current = false;
+      disposeOwnedListeners();
       // Reset session state on error
       // Preserve the selected UUID so a failed send cannot become a new conversation.
     }
@@ -1715,6 +1686,7 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
   // ============================================================================
 
   return {
-    handleSendPrompt
+    handleSendPrompt,
+    cancelPendingPrompt,
   };
 }

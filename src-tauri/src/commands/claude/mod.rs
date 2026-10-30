@@ -4,6 +4,7 @@ mod file_ops;
 mod file_access;
 mod hooks;
 mod models;
+mod output_drain;
 mod paths;
 mod platform;
 mod project_store;

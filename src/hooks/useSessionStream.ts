@@ -24,6 +24,7 @@ import {
 } from '@/lib/stream';
 import { codexConverter } from '@/lib/codexConverter';
 import { convertGeminiSessionDetailToClaudeMessages } from '@/lib/geminiConverter';
+import { sameClaudeProjectPath, watchClaudeCompletion } from '@/lib/claudeCompletionWatch';
 import {
   cacheModelFromInitMessage,
   cacheCodexModelFromStream,
@@ -143,6 +144,9 @@ export function useSessionStream(config: UseSessionStreamConfig): UseSessionStre
   // Internal refs
   const messageQueueRef = useRef<AsyncQueue<ClaudeStreamMessage> | null>(null);
   const loadingSessionIdRef = useRef<string | null>(null);
+  const connectionGenerationRef = useRef(0);
+  const currentSessionRef = useRef(session);
+  currentSessionRef.current = session;
 
   /**
    * 获取引擎类型
@@ -405,6 +409,35 @@ export function useSessionStream(config: UseSessionStreamConfig): UseSessionStre
 
     // 标记监听状态
     isListeningRef.current = true;
+    setIsLoading(true);
+    hasActiveSessionRef.current = true;
+
+    const generation = ++connectionGenerationRef.current;
+    const owner = session;
+    let completed = false;
+    const ownedListeners: UnlistenFn[] = [];
+    const isCurrent = () => !completed && isMountedRef.current
+      && connectionGenerationRef.current === generation && hasActiveSessionRef.current
+      && currentSessionRef.current?.id === owner?.id
+      && sameClaudeProjectPath(currentSessionRef.current?.project_path, owner?.project_path)
+      && (currentSessionRef.current?.engine || 'claude') === (owner?.engine || 'claude');
+    const retain = (unlisten: UnlistenFn) => {
+      if (!isCurrent()) { unlisten(); return; }
+      ownedListeners.push(unlisten);
+      unlistenRefs.current.push(unlisten);
+    };
+    const finish = () => {
+      if (!isCurrent()) return;
+      completed = true;
+      setIsLoading(false);
+      messageQueueRef.current?.done();
+      hasActiveSessionRef.current = false;
+      isListeningRef.current = false;
+      ownedListeners.splice(0).forEach(unlisten => {
+        unlisten();
+        unlistenRefs.current = unlistenRefs.current.filter(current => current !== unlisten);
+      });
+    };
 
     const engine = getEngine();
     const eventPrefix = engine === 'codex' ? 'codex' : engine === 'gemini' ? 'gemini' : 'claude';
@@ -412,73 +445,95 @@ export function useSessionStream(config: UseSessionStreamConfig): UseSessionStre
     // 创建消息队列（新架构核心）
     messageQueueRef.current = new AsyncQueue<ClaudeStreamMessage>();
 
-    // 监听输出（使用新的 Converter 注册中心）
-    const outputUnlisten = await listen<string>(
-      `${eventPrefix}-output:${sessionId}`,
-      async (event) => {
-        try {
-          if (!isMountedRef.current) return;
+    try {
+      // 监听输出（使用新的 Converter 注册中心）
+      const outputUnlisten = await listen<string>(
+        `${eventPrefix}-output:${sessionId}`,
+        async (event) => {
+          try {
+            if (!isCurrent()) return;
 
-          // 使用统一的转换器注册中心
-          const result = converterRegistry.convertLine(event.payload, engine);
-          if (result.message) {
-            // Cache model display name from init messages (engine-specific)
-            if (result.message.type === 'system' && result.message.subtype === 'init' && result.message.model) {
-              if (engine === 'codex') {
-                cacheCodexModelFromStream(result.message.model);
-              } else if (engine === 'gemini') {
-                cacheGeminiModelFromStream(result.message.model);
-              } else {
-                cacheModelFromInitMessage(result.message.model);
+            // 使用统一的转换器注册中心
+            const result = converterRegistry.convertLine(event.payload, engine);
+            if (result.message) {
+              // Cache model display name from init messages (engine-specific)
+              if (
+                result.message.type === "system" &&
+                result.message.subtype === "init" &&
+                result.message.model
+              ) {
+                if (engine === "codex") {
+                  cacheCodexModelFromStream(result.message.model);
+                } else if (engine === "gemini") {
+                  cacheGeminiModelFromStream(result.message.model);
+                } else {
+                  cacheModelFromInitMessage(result.message.model);
+                }
               }
+              // 加入消息队列
+              messageQueueRef.current?.enqueue(result.message);
+              // 处理消息（含翻译）
+              await processMessage(result.message, event.payload);
             }
-            // 加入消息队列
-            messageQueueRef.current?.enqueue(result.message);
-            // 处理消息（含翻译）
-            await processMessage(result.message, event.payload);
+          } catch (err) {
+            console.error("[useSessionStream] Failed to parse message:", err);
           }
-        } catch (err) {
-          console.error('[useSessionStream] Failed to parse message:', err);
-        }
-      }
-    );
-    unlistenRefs.current.push(outputUnlisten);
+        },
+      );
+      retain(outputUnlisten);
+      if (!isCurrent()) return;
 
-    // 监听错误
-    const errorUnlisten = await listen<string>(
-      `${eventPrefix}-error:${sessionId}`,
-      (event) => {
-        console.error('[useSessionStream] Error:', event.payload);
-        if (isMountedRef.current) {
+      // 监听错误
+      const errorUnlisten = await listen<string>(`${eventPrefix}-error:${sessionId}`, (event) => {
+        console.error("[useSessionStream] Error:", event.payload);
+        if (isCurrent()) {
           setError(event.payload);
         }
-      }
-    );
-    unlistenRefs.current.push(errorUnlisten);
+      });
+      retain(errorUnlisten);
+      if (!isCurrent()) return;
 
-    // 监听完成
-    const completeUnlisten = await listen<boolean>(
-      `${eventPrefix}-complete:${sessionId}`,
-      async () => {
-        if (isMountedRef.current) {
-          setIsLoading(false);
-          // 结束消息队列
-          messageQueueRef.current?.done();
-          // 重置状态
-          hasActiveSessionRef.current = false;
-          isListeningRef.current = false;
-          // 清理监听器
-          unlistenRefs.current.forEach(u => u && typeof u === 'function' && u());
-          unlistenRefs.current = [];
-        }
+      // 监听完成
+      const completeUnlisten = await listen<boolean>(
+        `${eventPrefix}-complete:${sessionId}`,
+        finish,
+      );
+      retain(completeUnlisten);
+      if (engine === "claude" && owner && isCurrent()) {
+        retain(
+          watchClaudeCompletion({
+            sessionId,
+            projectPath: owner.project_path,
+            isCurrent,
+            readPolicy: () => api.getClaudeSessionPolicy(sessionId, owner.project_path),
+            onEnded: async () => {
+              try {
+                const history = await api.loadSessionHistory(
+                  sessionId,
+                  currentSessionRef.current?.project_id || owner.project_id,
+                  "claude",
+                );
+                if (!isCurrent()) return;
+                if (!Array.isArray(history)) throw new Error("Invalid session history");
+                setMessages(history);
+                setRawJsonlOutput(history.map((message) => JSON.stringify(message)));
+              } catch {
+                if (!isCurrent()) return;
+                setError("本次运行已结束，但未能重新读取结果。请查看原会话记录后再决定是否重试。");
+              }
+              finish();
+            },
+          }),
+        );
       }
-    );
-    unlistenRefs.current.push(completeUnlisten);
-
-    // 更新状态
-    setIsLoading(true);
-    hasActiveSessionRef.current = true;
+    } catch (error) {
+      if (isCurrent()) {
+        setError(error instanceof Error ? error.message : String(error));
+        finish();
+      }
+    }
   }, [
+    session,
     isMountedRef,
     isListeningRef,
     hasActiveSessionRef,
@@ -487,12 +542,15 @@ export function useSessionStream(config: UseSessionStreamConfig): UseSessionStre
     setClaudeSessionId,
     setError,
     setIsLoading,
+    setMessages,
+    setRawJsonlOutput,
     processMessage,
   ]);
 
   // 清理（组件卸载时）
   useEffect(() => {
     return () => {
+      connectionGenerationRef.current += 1;
       messageQueueRef.current?.done();
       // 不在这里清理监听器，由组件自己清理
       // 因为 unlistenRefs 是外部传入的
